@@ -1,0 +1,66 @@
+name: Release
+
+# Pushing to `main` builds Worship Pads and publishes a draft GitHub Release
+# with the Windows installer(s). The release is tagged from the app version in
+# src-tauri/tauri.conf.json (bump it to cut a new version). Draft so you can
+# review the assets before publishing. Also runnable manually from the Actions
+# tab.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# tauri-action needs write access to create the release and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # ASIO support is compiled in. The ASIO SDK source is bundled in
+      # `src-tauri/third_party/ASIOSDK/` (used under the GPLv3 option of
+      # Steinberg's dual license — see NOTICE.md). `asio-sys`'s build script
+      # also needs `libclang.dll` for bindgen; LLVM is pre-installed on the
+      # `windows-latest` runner image, so we just point at it explicitly.
+      - name: Verify LLVM is available for bindgen
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) {
+            Write-Error "libclang.dll missing — the windows runner image may have changed. Install LLVM (choco install llvm -y) or update LIBCLANG_PATH."
+            exit 1
+          }
+          & "C:\Program Files\LLVM\bin\clang.exe" --version
+
+      - name: Build and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        with:
+          # __VERSION__ is replaced with the app version from tauri.conf.json.
+          tagName: v__VERSION__
+          releaseName: "Worship Pads v__VERSION__"
+          releaseDraft: true
+          prerelease: false

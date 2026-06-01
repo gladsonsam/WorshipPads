@@ -1,0 +1,419 @@
+//! Control surface for playback. The real work lives in `*_logic` free functions
+//! that take plain references, so both the Tauri commands (desktop UI) and the
+//! axum handlers (phone remote) drive identical behaviour.
+//!
+//! Every mutation persists settings and broadcasts NowPlaying to all clients.
+
+use std::path::PathBuf;
+
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, State};
+
+use crate::audio::{AudioEngine, DeviceInfo};
+use crate::library;
+use crate::model::{Key, NowPlaying, Preset, Settings};
+use crate::state::CoreState;
+
+// ---------------------------------------------------------------------------
+// Shared logic (used by both Tauri commands and the web server)
+// ---------------------------------------------------------------------------
+
+/// Emit the current NowPlaying to the desktop window and the broadcast bus.
+pub fn emit_now(app: &AppHandle, core: &CoreState) {
+    let now = core.snapshot();
+    let _ = app.emit("now-playing", now.clone());
+    let _ = core.tx.send(now);
+}
+
+fn resolve_file(settings: &Settings, key: Key) -> Option<PathBuf> {
+    settings
+        .active_preset()
+        .and_then(|p| p.files.get(&key).cloned())
+}
+
+pub fn set_volume_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    volume: f32,
+) -> Result<(), String> {
+    engine.set_volume(volume)?;
+    core.settings.lock().unwrap().master_volume = volume;
+    core.now.lock().unwrap().volume = volume;
+    emit_now(app, core);
+    core.save()
+}
+
+pub fn play_key_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    key: &str,
+) -> Result<(), String> {
+    let k = Key::parse(key).ok_or_else(|| format!("unknown key '{key}'"))?;
+
+    // Pressing the key that's already playing deselects it: fade out and stop.
+    let already_playing = {
+        let n = core.now.lock().unwrap();
+        n.playing && n.key == Some(k)
+    };
+    if already_playing {
+        return stop_logic(app, core, engine);
+    }
+
+    let (path, active) = {
+        let s = core.settings.lock().unwrap();
+        (resolve_file(&s, k), s.active_preset.clone())
+    };
+    let path = path
+        .ok_or_else(|| format!("no file mapped for key {} in the active preset", k.as_str()))?;
+
+    engine.play(path)?;
+    {
+        let mut n = core.now.lock().unwrap();
+        n.key = Some(k);
+        n.playing = true;
+        n.preset = active;
+    }
+    emit_now(app, core);
+    Ok(())
+}
+
+pub fn stop_logic(app: &AppHandle, core: &CoreState, engine: &AudioEngine) -> Result<(), String> {
+    engine.stop()?;
+    {
+        let mut n = core.now.lock().unwrap();
+        n.playing = false;
+        n.key = None;
+    }
+    emit_now(app, core);
+    Ok(())
+}
+
+pub fn set_preset_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    id: &str,
+) -> Result<(), String> {
+    {
+        let mut s = core.settings.lock().unwrap();
+        if !s.presets.iter().any(|p| p.id == id) {
+            return Err(format!("no preset '{id}'"));
+        }
+        s.active_preset = Some(id.to_string());
+    }
+    core.save()?;
+
+    // If a key is playing, crossfade into the same key of the new sound.
+    let current_key = core.now.lock().unwrap().key;
+    if let Some(k) = current_key {
+        let path = {
+            let s = core.settings.lock().unwrap();
+            resolve_file(&s, k)
+        };
+        if let Some(p) = path {
+            engine.play(p)?;
+        }
+    }
+    core.now.lock().unwrap().preset = Some(id.to_string());
+    emit_now(app, core);
+    Ok(())
+}
+
+pub fn set_crossfade_logic(
+    core: &CoreState,
+    engine: &AudioEngine,
+    ms: u32,
+) -> Result<(), String> {
+    let ms = ms.clamp(100, 15_000);
+    engine.set_crossfade(ms)?;
+    core.settings.lock().unwrap().crossfade_ms = ms;
+    core.save()
+}
+
+/// Assign (or move) an audio file to a key within a preset. If the key already
+/// held a file, that file returns to the preset's unmapped pile; if the incoming
+/// file was mapped to another key, it's moved (not duplicated).
+pub fn assign_key_logic(
+    core: &CoreState,
+    preset_id: &str,
+    key: Key,
+    path: PathBuf,
+) -> Result<(), String> {
+    {
+        let mut s = core.settings.lock().unwrap();
+        let preset = s
+            .presets
+            .iter_mut()
+            .find(|p| p.id == preset_id)
+            .ok_or_else(|| format!("no preset '{preset_id}'"))?;
+
+        // Detach the incoming file from wherever it currently lives.
+        preset.unmapped.retain(|p| p != &path);
+        preset.files.retain(|_, v| v != &path);
+
+        // Park any file previously on this key back in the unmapped pile.
+        if let Some(prev) = preset.files.insert(key, path) {
+            if !preset.unmapped.contains(&prev) {
+                preset.unmapped.push(prev);
+            }
+        }
+        preset.unmapped.sort();
+    }
+    core.save()
+}
+
+/// Unassign a key, returning its file (if any) to the unmapped pile.
+pub fn clear_key_logic(core: &CoreState, preset_id: &str, key: Key) -> Result<(), String> {
+    {
+        let mut s = core.settings.lock().unwrap();
+        let preset = s
+            .presets
+            .iter_mut()
+            .find(|p| p.id == preset_id)
+            .ok_or_else(|| format!("no preset '{preset_id}'"))?;
+        if let Some(path) = preset.files.remove(&key) {
+            if !preset.unmapped.contains(&path) {
+                preset.unmapped.push(path);
+                preset.unmapped.sort();
+            }
+        }
+    }
+    core.save()
+}
+
+/// Initial payload for a freshly-loaded phone remote.
+#[derive(Serialize)]
+pub struct PresetBrief {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Serialize)]
+pub struct Info {
+    pub keys: Vec<&'static str>,
+    pub presets: Vec<PresetBrief>,
+    pub active_preset: Option<String>,
+    pub mapped_keys: Vec<String>,
+    /// Active preset's key → file name (just the file name, no path), so the
+    /// phone remote can label each pad like the desktop does.
+    pub files: std::collections::HashMap<String, String>,
+    pub now: NowPlaying,
+}
+
+pub fn build_info(core: &CoreState) -> Info {
+    let now = core.snapshot();
+    let s = core.settings.lock().unwrap();
+    let presets = s
+        .presets
+        .iter()
+        .map(|p| PresetBrief {
+            id: p.id.clone(),
+            name: p.name.clone(),
+        })
+        .collect();
+    let active = s.active_preset();
+    let mapped_keys = active
+        .map(|p| p.files.keys().map(|k| k.as_str().to_string()).collect())
+        .unwrap_or_default();
+    let files = active
+        .map(|p| {
+            p.files
+                .iter()
+                .map(|(k, path)| {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    (k.as_str().to_string(), name)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Info {
+        keys: Key::ALL.iter().map(|k| k.as_str()).collect(),
+        presets,
+        active_preset: s.active_preset.clone(),
+        mapped_keys,
+        files,
+        now,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tauri command wrappers (desktop UI)
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn get_settings(core: State<'_, CoreState>) -> Settings {
+    core.settings.lock().unwrap().clone()
+}
+
+#[tauri::command]
+pub fn get_state(core: State<'_, CoreState>) -> NowPlaying {
+    core.snapshot()
+}
+
+#[tauri::command]
+pub fn list_audio_devices() -> Vec<DeviceInfo> {
+    AudioEngine::list_devices()
+}
+
+#[tauri::command]
+pub fn set_audio_output(
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    host: String,
+    device: String,
+    channel_left: usize,
+    channel_right: usize,
+) -> Result<(), String> {
+    engine.set_output(&host, &device, (channel_left, channel_right))?;
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.output_host = host;
+        s.output_device = Some(device);
+        s.channel_left = channel_left;
+        s.channel_right = channel_right;
+    }
+    core.save()
+}
+
+#[tauri::command]
+pub fn set_volume(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    volume: f32,
+) -> Result<(), String> {
+    set_volume_logic(&app, core.inner(), engine.inner(), volume)
+}
+
+#[tauri::command]
+pub fn scan_library(
+    core: State<'_, CoreState>,
+    folder: String,
+    name: Option<String>,
+) -> Result<Preset, String> {
+    let scanned = library::scan_preset(std::path::Path::new(&folder), name.clone())?;
+
+    let preset = {
+        let mut s = core.settings.lock().unwrap();
+        // Re-scanning a folder already added preserves the user's manual mappings.
+        let merged = match s.presets.iter().find(|p| p.id == scanned.id) {
+            Some(existing) => library::rescan_preserving(existing, name)?,
+            None => scanned,
+        };
+        s.presets.retain(|p| p.id != merged.id);
+        s.presets.push(merged.clone());
+        if s.active_preset.is_none() {
+            s.active_preset = Some(merged.id.clone());
+        }
+        merged
+    };
+    core.save()?;
+    Ok(preset)
+}
+
+#[tauri::command]
+pub fn assign_key(
+    core: State<'_, CoreState>,
+    id: String,
+    key: String,
+    path: String,
+) -> Result<(), String> {
+    let k = Key::parse(&key).ok_or_else(|| format!("unknown key '{key}'"))?;
+    assign_key_logic(core.inner(), &id, k, PathBuf::from(path))
+}
+
+#[tauri::command]
+pub fn clear_key(core: State<'_, CoreState>, id: String, key: String) -> Result<(), String> {
+    let k = Key::parse(&key).ok_or_else(|| format!("unknown key '{key}'"))?;
+    clear_key_logic(core.inner(), &id, k)
+}
+
+#[tauri::command]
+pub fn rename_preset(core: State<'_, CoreState>, id: String, name: String) -> Result<(), String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("name cannot be empty".into());
+    }
+    {
+        let mut s = core.settings.lock().unwrap();
+        let preset = s
+            .presets
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| format!("no preset '{id}'"))?;
+        preset.name = name;
+    }
+    core.save()
+}
+
+#[tauri::command]
+pub fn set_crossfade(
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    ms: u32,
+) -> Result<(), String> {
+    set_crossfade_logic(core.inner(), engine.inner(), ms)
+}
+
+#[tauri::command]
+pub fn remove_preset(core: State<'_, CoreState>, id: String) -> Result<(), String> {
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.presets.retain(|p| p.id != id);
+        if s.active_preset.as_deref() == Some(id.as_str()) {
+            s.active_preset = s.presets.first().map(|p| p.id.clone());
+        }
+    }
+    core.save()
+}
+
+#[tauri::command]
+pub fn set_preset(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    id: String,
+) -> Result<(), String> {
+    set_preset_logic(&app, core.inner(), engine.inner(), &id)
+}
+
+#[tauri::command]
+pub fn play_key(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    key: String,
+) -> Result<(), String> {
+    play_key_logic(&app, core.inner(), engine.inner(), &key)
+}
+
+#[tauri::command]
+pub fn stop(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+) -> Result<(), String> {
+    stop_logic(&app, core.inner(), engine.inner())
+}
+
+#[derive(Serialize)]
+pub struct ServerUrl {
+    pub ip: Option<String>,
+    pub host: String,
+    pub port: u16,
+}
+
+#[tauri::command]
+pub fn server_url(core: State<'_, CoreState>) -> ServerUrl {
+    let port = core.settings.lock().unwrap().server_port;
+    ServerUrl {
+        ip: crate::server::local_ipv4().map(|ip| ip.to_string()),
+        host: crate::server::mdns_host(),
+        port,
+    }
+}

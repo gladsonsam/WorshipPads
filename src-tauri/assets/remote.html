@@ -1,0 +1,763 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#1a1f27" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <title>Worship Pads Remote</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Cdefs%3E%3ClinearGradient id='t' x1='80' y1='80' x2='432' y2='432' gradientUnits='userSpaceOnUse'%3E%3Cstop offset='0' stop-color='%2374cad8'/%3E%3Cstop offset='1' stop-color='%234eabbc'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='32' y='32' width='448' height='448' rx='108' fill='url(%23t)'/%3E%3Cg transform='translate(117 117) scale(12.64)' fill='none' stroke='%231d242e' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2 13c2.4 0 2.4-5 4.8-5S9.2 17 11.6 17 14 8 16.4 8 19 13 20 13' stroke-width='1.7' opacity='0.95'/%3E%3Cpath d='M2 17.5h18' stroke-width='1.5' opacity='0.4'/%3E%3C/g%3E%3C/svg%3E"
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --sans: "Hanken Grotesk", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+          sans-serif;
+        --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+        /* dark theme · teal accent (matches the desktop app default) */
+        --bg: oklch(0.205 0.012 255);
+        --surface: oklch(0.248 0.014 255);
+        --surface-2: oklch(0.228 0.013 255);
+        --inset: oklch(0.19 0.011 255);
+        --line: oklch(0.322 0.014 255);
+        --line-2: oklch(0.38 0.016 255);
+        --text: oklch(0.955 0.005 255);
+        --text-2: oklch(0.76 0.012 255);
+        --text-3: oklch(0.61 0.013 255);
+        --accent: oklch(0.73 0.095 200);
+        --accent-ink: oklch(0.86 0.07 200);
+        --on-accent: oklch(0.17 0.02 255);
+        --danger: oklch(0.68 0.13 25);
+        --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+      }
+      * {
+        box-sizing: border-box;
+        -webkit-tap-highlight-color: transparent;
+      }
+      html,
+      body {
+        margin: 0;
+        min-height: 100%;
+      }
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: var(--sans);
+        -webkit-font-smoothing: antialiased;
+        display: flex;
+        flex-direction: column;
+        min-height: 100vh;
+        max-width: 460px;
+        margin: 0 auto;
+        padding: max(48px, env(safe-area-inset-top)) 18px calc(30px + env(safe-area-inset-bottom));
+      }
+      @keyframes meterPulse {
+        0%,
+        100% {
+          transform: scaleY(0.45);
+        }
+        50% {
+          transform: scaleY(1);
+        }
+      }
+
+      /* header */
+      header {
+        display: flex;
+        align-items: center;
+        gap: 11px;
+        margin-bottom: 18px;
+      }
+      .mark {
+        width: 32px;
+        height: 32px;
+        border-radius: 9px;
+        flex-shrink: 0;
+        background: linear-gradient(
+          160deg,
+          color-mix(in oklch, var(--accent) 92%, white 8%),
+          var(--accent)
+        );
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+      }
+      h1 {
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+        line-height: 1;
+        margin: 0;
+        flex: 1;
+      }
+      #status {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--line-2);
+        flex-shrink: 0;
+        transition: background 0.2s ease, opacity 0.2s ease;
+        opacity: 0;
+      }
+      #status.reconnecting {
+        background: var(--danger);
+        opacity: 1;
+        animation: meterPulse 1.4s ease-in-out infinite;
+      }
+
+      /* bank selector + view toggle */
+      .bank-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 18px;
+      }
+      .field {
+        position: relative;
+        flex: 1;
+        height: 46px;
+      }
+      .field select {
+        appearance: none;
+        -webkit-appearance: none;
+        width: 100%;
+        height: 100%;
+        border-radius: 12px;
+        border: 1px solid var(--line);
+        background: var(--surface-2);
+        color: var(--text);
+        font-size: 15px;
+        font-family: var(--sans);
+        padding: 0 38px 0 15px;
+      }
+      .field .chev {
+        position: absolute;
+        right: 13px;
+        top: 50%;
+        transform: translateY(-50%);
+        pointer-events: none;
+        display: flex;
+      }
+      .seg {
+        display: inline-flex;
+        gap: 3px;
+        padding: 3px;
+        border-radius: 12px;
+        background: var(--surface-2);
+        border: 1px solid var(--line);
+      }
+      .seg button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 40px;
+        height: 40px;
+        border-radius: 9px;
+        border: none;
+        cursor: pointer;
+        background: transparent;
+        color: var(--text-3);
+      }
+      .seg button.on {
+        background: var(--surface);
+        box-shadow: var(--shadow-sm);
+        color: var(--accent-ink);
+      }
+
+      /* pads */
+      .pads {
+        flex: 1;
+      }
+      .pads.grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 9px;
+      }
+      .pad {
+        position: relative;
+        min-width: 0;
+        height: 92px;
+        border-radius: 13px;
+        padding: 12px 14px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        text-align: left;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        box-shadow: var(--shadow-sm);
+        color: var(--text);
+        cursor: pointer;
+        transition: background 0.2s ease, border-color 0.2s ease, transform 0.06s ease;
+      }
+      .pad:active:not(:disabled) {
+        transform: scale(0.97);
+      }
+      .pad:disabled {
+        background: var(--surface-2);
+        opacity: 0.6;
+        box-shadow: none;
+        cursor: default;
+      }
+      .pad.active {
+        background: color-mix(in oklch, var(--accent) 16%, var(--surface));
+        border-color: color-mix(in oklch, var(--accent) 45%, transparent);
+        box-shadow: 0 2px 12px color-mix(in oklch, var(--accent) 20%, transparent);
+      }
+      .pad-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .pad .note {
+        font-size: 24px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+      .pad:disabled .note {
+        color: var(--text-3);
+      }
+      .pad.active .note,
+      .pad.active .file {
+        color: var(--accent-ink);
+      }
+      .pad .file {
+        font-size: 11.5px;
+        font-family: var(--mono);
+        color: var(--text-3);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .pad .file.empty {
+        font-family: var(--sans);
+        font-style: italic;
+      }
+
+      /* meter */
+      .meter {
+        display: flex;
+        align-items: flex-end;
+        gap: 3px;
+        height: 16px;
+      }
+      .meter .bar {
+        width: 3px;
+        height: 16px;
+        border-radius: 3px;
+        transform-origin: bottom;
+        background: var(--accent);
+        opacity: 0.9;
+      }
+
+      /* piano */
+      .pads.piano {
+        position: relative;
+        display: flex;
+        gap: 6px;
+        height: 230px;
+        align-items: stretch;
+      }
+      .pkey-wrap {
+        position: relative;
+        flex: 1;
+      }
+      .pkey {
+        width: 100%;
+        height: 100%;
+        border-radius: 8px 8px 12px 12px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        box-shadow: var(--shadow-sm);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: flex-end;
+        padding-bottom: 16px;
+        gap: 6px;
+        cursor: pointer;
+      }
+      .pkey:active:not(:disabled) {
+        transform: translateY(1px);
+      }
+      .pkey:disabled {
+        cursor: default;
+      }
+      .pkey .note {
+        font-size: 17px;
+        font-weight: 600;
+        color: var(--text);
+      }
+      .pkey.active {
+        background: linear-gradient(
+          to top,
+          color-mix(in oklch, var(--accent) 30%, var(--surface)),
+          var(--surface)
+        );
+        border-color: color-mix(in oklch, var(--accent) 45%, transparent);
+      }
+      .pkey.active .note {
+        color: var(--accent-ink);
+      }
+      .pkey .dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 999px;
+        background: var(--line-2);
+      }
+      .pkey .dot.has {
+        background: var(--accent);
+      }
+      .bkey {
+        position: absolute;
+        top: 0;
+        right: -15px;
+        width: 26px;
+        height: 58%;
+        z-index: 3;
+        border-radius: 5px 5px 8px 8px;
+        background: oklch(0.3 0.014 255);
+        border: 1px solid rgba(0, 0, 0, 0.45);
+        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.32);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: flex-end;
+        padding-bottom: 9px;
+        gap: 5px;
+        cursor: pointer;
+      }
+      .bkey .note {
+        font-size: 11px;
+        font-weight: 600;
+        color: rgba(255, 255, 255, 0.82);
+      }
+      .bkey.active {
+        background: color-mix(in oklch, var(--accent) 62%, #1a1f27);
+        border-color: color-mix(in oklch, var(--accent) 55%, transparent);
+      }
+      .bkey.active .note {
+        color: var(--on-accent);
+      }
+      .bkey .dot {
+        width: 5px;
+        height: 5px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.28);
+      }
+      .bkey .dot.has {
+        background: var(--accent);
+      }
+
+      /* volume */
+      .vol {
+        display: flex;
+        align-items: center;
+        gap: 13px;
+        margin: 20px 2px 16px;
+      }
+      input[type="range"] {
+        -webkit-appearance: none;
+        appearance: none;
+        flex: 1;
+        height: 22px;
+        background: transparent;
+        margin: 0;
+      }
+      input[type="range"]::-webkit-slider-runnable-track {
+        height: 5px;
+        border-radius: 999px;
+        background: linear-gradient(var(--accent), var(--accent)) 0 / var(--pct, 80%) 100% no-repeat,
+          var(--inset);
+      }
+      input[type="range"]::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        width: 22px;
+        height: 22px;
+        margin-top: -8.5px;
+        border-radius: 999px;
+        background: var(--surface);
+        border: 1px solid var(--line-2);
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+      }
+      input[type="range"]::-moz-range-track {
+        height: 5px;
+        border-radius: 999px;
+        background: var(--inset);
+      }
+      input[type="range"]::-moz-range-progress {
+        height: 5px;
+        border-radius: 999px;
+        background: var(--accent);
+      }
+      input[type="range"]::-moz-range-thumb {
+        width: 22px;
+        height: 22px;
+        border: 1px solid var(--line-2);
+        border-radius: 999px;
+        background: var(--surface);
+      }
+      .vol .num {
+        font-family: var(--mono);
+        font-size: 15px;
+        font-weight: 500;
+        color: var(--text-2);
+        width: 34px;
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+
+      /* transport */
+      .transport {
+        height: 56px;
+        border-radius: 15px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        font-size: 16px;
+        font-weight: 600;
+        font-family: var(--sans);
+        border: 1px solid transparent;
+        cursor: pointer;
+        width: 100%;
+      }
+      .transport.live {
+        background: color-mix(in oklch, var(--danger) 12%, var(--surface));
+        color: var(--danger);
+        border-color: color-mix(in oklch, var(--danger) 34%, transparent);
+      }
+      .transport.idle {
+        background: var(--surface);
+        color: var(--text);
+        border-color: var(--line-2);
+        opacity: 0.55;
+        cursor: default;
+      }
+      .hint {
+        text-align: center;
+        font-size: 12.5px;
+        color: var(--text-3);
+        margin-top: 12px;
+        min-height: 16px;
+      }
+
+      /* Landscape phones: use full width for a normal-looking piano, and
+         trim vertical chrome so the keys aren't squashed into ~80px. */
+      @media (orientation: landscape) and (max-height: 600px) {
+        body {
+          max-width: min(820px, 100vw);
+          padding: max(14px, env(safe-area-inset-top))
+            max(18px, env(safe-area-inset-right))
+            calc(14px + env(safe-area-inset-bottom))
+            max(18px, env(safe-area-inset-left));
+        }
+        header {
+          margin-bottom: 10px;
+        }
+        .bank-row {
+          margin-bottom: 12px;
+        }
+        .vol {
+          margin: 12px 2px 10px;
+        }
+        .transport {
+          height: 48px;
+        }
+        .hint {
+          margin-top: 6px;
+          min-height: 0;
+        }
+        .pads.piano {
+          min-height: 200px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span class="mark" aria-hidden="true">
+        <svg width="20" height="20" viewBox="0 0 22 22">
+          <path
+            d="M2 13c2.4 0 2.4-5 4.8-5S9.2 17 11.6 17 14 8 16.4 8 19 13 20 13"
+            fill="none"
+            stroke="var(--on-accent)"
+            stroke-width="1.7"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            opacity="0.95"
+          />
+          <path
+            d="M2 17.5h18"
+            fill="none"
+            stroke="var(--on-accent)"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            opacity="0.4"
+          />
+        </svg>
+      </span>
+      <h1>Worship Pads</h1>
+      <span id="status" title="connection"></span>
+    </header>
+
+    <div class="bank-row">
+      <div class="field">
+        <select id="preset" aria-label="Bank"></select>
+        <span class="chev">
+          <svg width="15" height="15" viewBox="0 0 20 20">
+            <path
+              d="M5 7.5l5 5 5-5"
+              fill="none"
+              stroke="var(--text-3)"
+              stroke-width="1.6"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </span>
+      </div>
+      <div class="seg" id="seg">
+        <button data-style="grid" title="Grid" aria-label="Grid view">
+          <svg width="16" height="16" viewBox="0 0 20 20" class="ico">
+            <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="4" y="4" width="5" height="5" rx="1.2" />
+              <rect x="11" y="4" width="5" height="5" rx="1.2" />
+              <rect x="4" y="11" width="5" height="5" rx="1.2" />
+              <rect x="11" y="11" width="5" height="5" rx="1.2" />
+            </g>
+          </svg>
+        </button>
+        <button data-style="piano" title="Piano" aria-label="Piano view">
+          <svg width="16" height="16" viewBox="0 0 20 20" class="ico">
+            <g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3.5" y="4.5" width="13" height="11" rx="1.6" />
+              <path d="M7.3 4.5v11M10 4.5v11M12.7 4.5v11" />
+            </g>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="pads grid" id="pads"></div>
+
+    <div class="vol">
+      <svg width="19" height="19" viewBox="0 0 20 20" aria-hidden="true">
+        <g fill="none" stroke="var(--text-3)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 8v4h3l4 3V5L7 8H4z" />
+          <path d="M13.5 7.5a4 4 0 0 1 0 5" />
+        </g>
+      </svg>
+      <input id="vol" type="range" min="0" max="100" value="80" aria-label="Volume" />
+      <span class="num" id="volval">80</span>
+    </div>
+
+    <button class="transport idle" id="transport">Tap a pad to begin</button>
+    <p class="hint" id="hint"></p>
+
+    <script>
+      const KEYS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+      const SHARPS = new Set(["C#", "D#", "F#", "G#", "A#"]);
+      const BLACK_AFTER = { C: "C#", D: "D#", F: "F#", G: "G#", A: "A#" };
+      const STYLE_KEY = "worshippads.remote.padStyle";
+
+      let mappedKeys = new Set();
+      let files = {}; // note -> filename
+      let now = { key: null, playing: false, volume: 0.8 };
+      let padStyle = localStorage.getItem(STYLE_KEY) || "grid";
+
+      const padsEl = document.getElementById("pads");
+      const presetSel = document.getElementById("preset");
+      const vol = document.getElementById("vol");
+      const volval = document.getElementById("volval");
+      const statusEl = document.getElementById("status");
+      const transportEl = document.getElementById("transport");
+      const hintEl = document.getElementById("hint");
+      const segEl = document.getElementById("seg");
+
+      const POWER_ICON =
+        '<svg width="18" height="18" viewBox="0 0 20 20" aria-hidden="true"><g fill="none" stroke="var(--danger)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3v7"/><path d="M5.5 6a6 6 0 1 0 9 0"/></g></svg>';
+
+      function post(path, body) {
+        return fetch(path, {
+          method: "POST",
+          headers: body ? { "Content-Type": "application/json" } : {},
+          body: body ? JSON.stringify(body) : undefined,
+        }).catch(() => {});
+      }
+
+      function meterMarkup() {
+        let bars = "";
+        for (let i = 0; i < 4; i++) {
+          const dur = 2.4 + (i % 4) * 0.5;
+          const delay = i * 0.18;
+          bars += `<span class="bar" style="animation:meterPulse ${dur}s ease-in-out ${delay}s infinite"></span>`;
+        }
+        return `<span class="meter">${bars}</span>`;
+      }
+
+      function trigger(k) {
+        // Tap the live pad again → fade it out (matches the on-screen hint).
+        if (now.playing && now.key === k) post("/api/stop");
+        else post(`/api/play/${encodeURIComponent(k)}`);
+      }
+
+      function renderPads() {
+        padsEl.className = "pads " + padStyle;
+        padsEl.innerHTML = "";
+        // keep the seg toggle in sync
+        for (const b of segEl.children) b.classList.toggle("on", b.dataset.style === padStyle);
+
+        if (padStyle === "piano") return renderPiano();
+
+        for (const k of KEYS) {
+          const file = files[k];
+          const mapped = !!file || mappedKeys.has(k);
+          const active = now.playing && now.key === k;
+          const b = document.createElement("button");
+          b.className = "pad" + (active ? " active" : "");
+          b.disabled = !mapped;
+          b.innerHTML =
+            `<span class="pad-top"><span class="note">${k}</span>${active ? meterMarkup() : ""}</span>` +
+            `<span class="file${file ? "" : " empty"}">${file || "empty"}</span>`;
+          if (mapped) b.onclick = () => trigger(k);
+          padsEl.appendChild(b);
+        }
+      }
+
+      function renderPiano() {
+        const whites = KEYS.filter((k) => !SHARPS.has(k));
+        for (const n of whites) {
+          const wrap = document.createElement("div");
+          wrap.className = "pkey-wrap";
+
+          const has = !!files[n] || mappedKeys.has(n);
+          const active = now.playing && now.key === n;
+          const w = document.createElement("button");
+          w.className = "pkey" + (active ? " active" : "");
+          w.disabled = !has;
+          w.innerHTML =
+            (active ? `<span style="margin-bottom:4px">${meterMarkup()}</span>` : "") +
+            `<span class="note">${n}</span><span class="dot${has ? " has" : ""}"></span>`;
+          if (has) w.onclick = () => trigger(n);
+          wrap.appendChild(w);
+
+          const bn = BLACK_AFTER[n];
+          if (bn) {
+            const bHas = !!files[bn] || mappedKeys.has(bn);
+            const bActive = now.playing && now.key === bn;
+            const bk = document.createElement("button");
+            bk.className = "bkey" + (bActive ? " active" : "");
+            bk.disabled = !bHas;
+            bk.innerHTML = `<span class="note">${bn}</span><span class="dot${bHas ? " has" : ""}"></span>`;
+            if (bHas) bk.onclick = () => trigger(bn);
+            wrap.appendChild(bk);
+          }
+          padsEl.appendChild(wrap);
+        }
+      }
+
+      function renderTransport() {
+        if (now.playing) {
+          transportEl.className = "transport live";
+          transportEl.innerHTML = POWER_ICON + "Stop / Fade out";
+          transportEl.onclick = () => post("/api/stop");
+          hintEl.textContent = "Tap the glowing pad again to fade it out.";
+        } else {
+          transportEl.className = "transport idle";
+          transportEl.textContent = "Tap a pad to begin";
+          transportEl.onclick = null;
+          hintEl.textContent = "";
+        }
+      }
+
+      function applyNow(n) {
+        now = n;
+        renderPads();
+        renderTransport();
+        if (document.activeElement !== vol) {
+          const v = Math.round((n.volume ?? 0.8) * 100);
+          vol.value = v;
+          vol.style.setProperty("--pct", v + "%");
+          volval.textContent = v;
+        }
+      }
+
+      function applyInfo(info) {
+        presetSel.innerHTML = "";
+        if (!info.presets.length) {
+          const o = document.createElement("option");
+          o.textContent = "No banks — add one in the desktop app";
+          o.disabled = true;
+          presetSel.appendChild(o);
+        }
+        for (const p of info.presets) {
+          const o = document.createElement("option");
+          o.value = p.id;
+          o.textContent = p.name;
+          if (p.id === info.active_preset) o.selected = true;
+          presetSel.appendChild(o);
+        }
+        mappedKeys = new Set(info.mapped_keys || []);
+        files = info.files || {};
+        renderPads();
+      }
+
+      presetSel.onchange = () => post(`/api/preset/${encodeURIComponent(presetSel.value)}`);
+      vol.oninput = () => {
+        vol.style.setProperty("--pct", vol.value + "%");
+        volval.textContent = vol.value;
+      };
+      vol.onchange = () => post("/api/volume", { volume: Number(vol.value) / 100 });
+      for (const b of segEl.children) {
+        b.onclick = () => {
+          padStyle = b.dataset.style;
+          localStorage.setItem(STYLE_KEY, padStyle);
+          renderPads();
+        };
+      }
+
+      async function loadInfo() {
+        try {
+          const info = await (await fetch("/api/info")).json();
+          applyInfo(info);
+          applyNow(info.now);
+        } catch (_) {}
+      }
+
+      function connectWs() {
+        const proto = location.protocol === "https:" ? "wss" : "ws";
+        const ws = new WebSocket(`${proto}://${location.host}/ws`);
+        ws.onopen = () => statusEl.classList.remove("reconnecting");
+        ws.onclose = () => {
+          statusEl.classList.add("reconnecting");
+          setTimeout(connectWs, 1500);
+        };
+        ws.onmessage = (e) => {
+          try {
+            applyNow(JSON.parse(e.data));
+          } catch (_) {}
+        };
+      }
+
+      vol.style.setProperty("--pct", "80%");
+      renderPads();
+      renderTransport();
+      loadInfo();
+      connectWs();
+    </script>
+  </body>
+</html>

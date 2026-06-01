@@ -1,0 +1,17 @@
+# Build-time environment for the Rust crates in `src-tauri`.
+#
+# `CPAL_ASIO_DIR` points at the Steinberg ASIO SDK source bundled in this repo
+# under `src-tauri/third_party/ASIOSDK/` (used under the GPLv3 option of
+# Steinberg's dual license — see NOTICE.md). With `relative = true` the path is
+# resolved against the parent dir of this config file, i.e. `src-tauri/`, so it
+# works in CI checkouts and on any developer machine without hard-coding.
+#
+# `LIBCLANG_PATH` is needed by bindgen (used by asio-sys) to parse the ASIO
+# C++ headers. The default path matches both common Windows LLVM installs
+# (`winget install LLVM.LLVM`) and the LLVM pre-installed on the
+# `windows-latest` GitHub Actions runner image. Override with the env var if
+# yours lives elsewhere.
+
+[env]
+CPAL_ASIO_DIR = { value = "third_party/ASIOSDK", relative = true, force = false }
+LIBCLANG_PATH = { value = "C:\\Program Files\\LLVM\\bin", force = false }

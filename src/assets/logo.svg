@@ -1,0 +1,13 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Worship Pads">
+  <defs>
+    <linearGradient id="tile" x1="80" y1="80" x2="432" y2="432" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#74cad8"/>
+      <stop offset="1" stop-color="#4eabbc"/>
+    </linearGradient>
+  </defs>
+  <rect x="32" y="32" width="448" height="448" rx="108" fill="url(#tile)"/>
+  <g transform="translate(117 117) scale(12.64)" fill="none" stroke="#1d242e" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M2 13c2.4 0 2.4-5 4.8-5S9.2 17 11.6 17 14 8 16.4 8 19 13 20 13" stroke-width="1.7" opacity="0.95"/>
+    <path d="M2 17.5h18" stroke-width="1.5" opacity="0.4"/>
+  </g>
+</svg>
