@@ -1,8 +1,8 @@
-# setup.ps1 — checks the prerequisites needed to build Worship Pads with
+# setup.ps1 — checks the prerequisites needed to build StagePal with
 # ASIO support. Run from a PowerShell prompt:  .\setup.ps1
 # This script only inspects your machine; it does not install anything.
 
-Write-Host "Worship Pads — environment check`n" -ForegroundColor Cyan
+Write-Host "StagePal — environment check`n" -ForegroundColor Cyan
 
 function Test-Tool($name, $cmd, $hint) {
     if (Get-Command $cmd -ErrorAction SilentlyContinue) {

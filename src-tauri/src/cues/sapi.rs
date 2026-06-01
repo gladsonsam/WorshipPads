@@ -95,7 +95,7 @@ impl Synthesizer for SapiSynth {
 pub fn temp_wav_path() -> std::path::PathBuf {
     let pid = std::process::id();
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("worshippads-cue-{pid}-{n}.wav"))
+    std::env::temp_dir().join(format!("stagepal-cue-{pid}-{n}.wav"))
 }
 
 /// Escape a string for embedding inside a PowerShell single-quoted literal.

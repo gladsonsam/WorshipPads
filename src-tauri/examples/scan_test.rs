@@ -3,8 +3,8 @@
 
 use std::path::Path;
 
-use worshippads_lib::library::scan_preset;
-use worshippads_lib::model::Key;
+use stagepal_lib::library::scan_preset;
+use stagepal_lib::model::Key;
 
 fn main() {
     let folder = std::env::args().nth(1).expect("usage: scan_test <folder>");

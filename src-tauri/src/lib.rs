@@ -1,4 +1,4 @@
-// Worship Pads — Tauri backend entrypoint.
+// StagePal — Tauri backend entrypoint.
 // Phase 1: hidden-on-boot, system tray, single instance, autostart.
 // Phase 2: audio engine (device routing + crossfade playback).
 // Phase 3: core state, presets/library, settings persistence.
@@ -185,7 +185,7 @@ pub fn run() {
 
             TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("Worship Pads")
+                .tooltip("StagePal")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {

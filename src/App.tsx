@@ -27,8 +27,8 @@ import { SettingsPage } from "./components/SettingsPage";
 import { ConnectModal } from "./components/ConnectModal";
 import "./App.css";
 
-const PAD_STYLE_KEY = "worshippads.padStyle";
-const PAGE_KEY = "worshippads.page";
+const PAD_STYLE_KEY = "stagepal.padStyle";
+const PAGE_KEY = "stagepal.page";
 
 type Page = "pads" | "click" | "cues" | "library" | "settings";
 const PAGES: Page[] = ["pads", "click", "cues", "library", "settings"];
@@ -161,7 +161,7 @@ function App() {
     <div className="app">
       <header className="app-header">
         <Mark size={42} />
-        <div className="app-title">Worship Pads</div>
+        <div className="app-title">StagePal</div>
         <div style={{ flex: 1 }} />
         <button className="btn btn-ghost" onClick={() => setConnectOpen(true)}>
           <Icon name="phone" size={16} stroke="var(--text-2)" /> Connect phone

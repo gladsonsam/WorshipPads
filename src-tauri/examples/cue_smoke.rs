@@ -4,7 +4,7 @@
 //! Lists installed voices and renders a short phrase to a WAV in the system
 //! temp dir, printing its path. Open the WAV manually to verify it speaks.
 
-use worshippads_lib::cues::{SapiSynth, Synthesizer};
+use stagepal_lib::cues::{SapiSynth, Synthesizer};
 
 fn main() {
     let synth = SapiSynth::new();
@@ -20,7 +20,7 @@ fn main() {
         Err(e) => println!("voices failed: {e}"),
     }
 
-    let out = std::env::temp_dir().join("worshippads-cue-smoke.wav");
+    let out = std::env::temp_dir().join("stagepal-cue-smoke.wav");
     let text = "Verse two.";
     match synth.synth_to_wav(text, None, 0, &out) {
         Ok(()) => println!("wrote {} bytes -> {}", file_size(&out), out.display()),

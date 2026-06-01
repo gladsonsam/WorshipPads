@@ -1,6 +1,6 @@
 name: Release
 
-# Pushing to `main` builds Worship Pads and publishes a draft GitHub Release
+# Pushing to `main` builds StagePal and publishes a draft GitHub Release
 # with the Windows installer(s). The release is tagged from the app version in
 # src-tauri/tauri.conf.json (bump it to cut a new version). Draft so you can
 # review the assets before publishing. Also runnable manually from the Actions
@@ -61,6 +61,6 @@ jobs:
         with:
           # __VERSION__ is replaced with the app version from tauri.conf.json.
           tagName: v__VERSION__
-          releaseName: "Worship Pads v__VERSION__"
+          releaseName: "StagePal v__VERSION__"
           releaseDraft: true
           prerelease: false

@@ -1,15 +1,15 @@
 <p align="center">
-  <img src="public/logo.svg" alt="Worship Pads" width="112" height="112" />
+  <img src="public/logo.svg" alt="StagePal" width="112" height="112" />
 </p>
 
-<h1 align="center">Worship Pads</h1>
+<h1 align="center">StagePal</h1>
 
 A Tauri desktop app that plays looping worship pads locally and
 routes them to specific channels of any audio interface (via ASIO),
 while your phone acts as a wireless remote.
 
 <p align="center">
-  <img src="public/screenshots/app.png" alt="Worship Pads desktop app" width="500" />
+  <img src="public/screenshots/app.png" alt="StagePal desktop app" width="500" />
   &nbsp;
   <img src="public/screenshots/remote.png" alt="Phone remote" height="367" />
 </p>

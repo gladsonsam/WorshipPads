@@ -14,8 +14,8 @@ import type { Info } from "./api";
 
 type Tab = "pads" | "click" | "cues";
 
-const STYLE_KEY = "worshippads.remote.padStyle";
-const TAB_KEY = "worshippads.remote.tab";
+const STYLE_KEY = "stagepal.remote.padStyle";
+const TAB_KEY = "stagepal.remote.tab";
 
 /** Shape passed to each tab's renderer. Tabs only render the props they use. */
 interface TabContext {
@@ -87,7 +87,7 @@ export default function App() {
         <span className="mark" aria-hidden>
           <MarkLogoIcon />
         </span>
-        <h1>Worship Pads</h1>
+        <h1>StagePal</h1>
         <span
           className={`status${conn === "reconnecting" ? " reconnecting" : ""}`}
           title="connection"

@@ -98,7 +98,7 @@ fn advertise_mdns(port: u16) {
 
     match ServiceInfo::new(
         "_http._tcp.local.",
-        "Worship Pads",
+        "StagePal",
         &host_name,
         ip.as_str(),
         port,
@@ -253,6 +253,7 @@ async fn cue_speak(State(app): State<AppHandle>, Json(body): Json<SpeakBody>) ->
         engine.inner(),
         synth.0.as_ref(),
         &body.text,
+        None,
         None,
     ))
 }

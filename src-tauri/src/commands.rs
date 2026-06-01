@@ -89,10 +89,13 @@ pub fn play_key_logic(
     emit_now(app, core);
 
     // Auto-announce the new key. Best-effort: a synthesis hiccup mustn't
-    // surface as a failed key press.
+    // surface as a failed key press. The phrase is short enough that a single
+    // letter at the saved rate flies past — render this one cue at a fixed
+    // slow rate (~-4) so "G" gets enough airtime to register, regardless of
+    // the user's saved rate for their own cues.
     if speak_key {
         let text = format!("Key of {}", k.spoken());
-        let _ = cue_speak_logic(app, core, engine, synth, &text, None);
+        let _ = cue_speak_logic(app, core, engine, synth, &text, None, Some(-4));
     }
     Ok(())
 }
@@ -639,6 +642,9 @@ pub fn set_click_channels(
 /// the cue bus. Sets `now.cue.speaking = true` synchronously so the UI flips
 /// the moment the user taps; the matching `false` flip arrives via the
 /// engine's `CueEnded` event (see lib.rs setup).
+///
+/// `rate_override` bypasses the user's saved cue rate — used by the auto
+/// key-announcement so the short phrase doesn't fly past.
 pub fn cue_speak_logic(
     app: &AppHandle,
     core: &CoreState,
@@ -646,15 +652,17 @@ pub fn cue_speak_logic(
     synth: &dyn Synthesizer,
     text: &str,
     label: Option<String>,
+    rate_override: Option<i32>,
 ) -> Result<(), String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Err("nothing to speak".into());
     }
-    let (voice, rate) = {
+    let (voice, saved_rate) = {
         let s = core.settings.lock().unwrap();
         (s.cues.voice.clone(), s.cues.rate)
     };
+    let rate = rate_override.unwrap_or(saved_rate).clamp(-10, 10);
     let out = cues::sapi_temp_wav_path();
     synth.synth_to_wav(trimmed, voice.as_deref(), rate, &out)?;
     engine.play_cue(out)?;
@@ -694,7 +702,7 @@ pub fn cue_speak_quick_logic(
             .cloned()
             .ok_or_else(|| format!("no quick cue '{id}'"))?
     };
-    cue_speak_logic(app, core, engine, synth, &cue.text, Some(cue.label))
+    cue_speak_logic(app, core, engine, synth, &cue.text, Some(cue.label), None)
 }
 
 /// Mint a short opaque id from the current time so quick cues survive
@@ -848,7 +856,7 @@ pub fn cue_speak(
     synth: State<'_, CueSynth>,
     text: String,
 ) -> Result<(), String> {
-    cue_speak_logic(&app, core.inner(), engine.inner(), synth.0.as_ref(), &text, None)
+    cue_speak_logic(&app, core.inner(), engine.inner(), synth.0.as_ref(), &text, None, None)
 }
 
 #[tauri::command]
