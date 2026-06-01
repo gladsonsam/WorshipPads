@@ -772,10 +772,16 @@ pub fn set_cue_rate_logic(core: &CoreState, rate: i32) -> Result<(), String> {
     core.save()
 }
 
-pub fn set_cue_volume_logic(core: &CoreState, volume: f32) -> Result<(), String> {
+pub fn set_cue_volume_logic(
+    core: &CoreState,
+    engine: &AudioEngine,
+    volume: f32,
+) -> Result<(), String> {
+    let v = volume.clamp(0.0, 1.0);
+    engine.set_cue_volume(v)?;
     {
         let mut s = core.settings.lock().unwrap();
-        s.cues.volume = volume.clamp(0.0, 1.0);
+        s.cues.volume = v;
     }
     core.save()
 }
@@ -884,8 +890,12 @@ pub fn set_cue_rate(core: State<'_, CoreState>, rate: i32) -> Result<(), String>
 }
 
 #[tauri::command]
-pub fn set_cue_volume(core: State<'_, CoreState>, volume: f32) -> Result<(), String> {
-    set_cue_volume_logic(core.inner(), volume)
+pub fn set_cue_volume(
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    volume: f32,
+) -> Result<(), String> {
+    set_cue_volume_logic(core.inner(), engine.inner(), volume)
 }
 
 #[tauri::command]

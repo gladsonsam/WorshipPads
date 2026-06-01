@@ -43,6 +43,7 @@ fn restore_audio(app: &tauri::AppHandle) {
         click_channels,
         cue_channels,
         volume,
+        cue_volume,
         crossfade_ms,
         click_bpm,
         click_beats,
@@ -58,6 +59,7 @@ fn restore_audio(app: &tauri::AppHandle) {
             (s.click.channel_left, s.click.channel_right),
             (s.cues.channel_left, s.cues.channel_right),
             s.master_volume,
+            s.cues.volume,
             s.crossfade_ms,
             s.click.bpm,
             s.click.beats_per_bar,
@@ -68,6 +70,7 @@ fn restore_audio(app: &tauri::AppHandle) {
     };
 
     let _ = engine.set_volume(volume);
+    let _ = engine.set_cue_volume(cue_volume);
     let _ = engine.set_crossfade(crossfade_ms);
     let _ = engine.set_click_bpm(click_bpm);
     let _ = engine.set_click_beats(click_beats);

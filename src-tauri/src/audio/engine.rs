@@ -77,6 +77,7 @@ enum PlayCommand {
     /// Stop any in-flight cue.
     StopCue(f32),
     SetMaster(f32),
+    SetCueVolume(f32),
     SetClickEnabled(bool),
     SetClickBpm(f32),
     SetClickBeats(u32),
@@ -126,6 +127,7 @@ enum EngineCommand {
     PlayCue(PathBuf),
     StopCue,
     SetVolume(f32),
+    SetCueVolume(f32),
     SetCrossfade(u32),
     SetClickEnabled(bool),
     SetClickBpm(f32),
@@ -321,6 +323,12 @@ impl AudioEngine {
             .map_err(|_| "audio host thread is gone".to_string())
     }
 
+    pub fn set_cue_volume(&self, volume: f32) -> Result<(), String> {
+        self.tx
+            .send(EngineCommand::SetCueVolume(volume.clamp(0.0, 1.0)))
+            .map_err(|_| "audio host thread is gone".to_string())
+    }
+
     /// Set the crossfade/fade-out duration (milliseconds) used for subsequent
     /// `play`/`stop` calls.
     pub fn set_crossfade(&self, ms: u32) -> Result<(), String> {
@@ -405,6 +413,7 @@ fn host_thread(
 ) {
     let mut active: Option<ActiveStream> = None;
     let mut master: f32 = 0.8;
+    let mut cue_volume: f32 = 1.0;
     let mut crossfade_ms: u32 = DEFAULT_CROSSFADE_MS;
     // Last known device + channel layout, so SetClickChannels / SetCueChannels
     // can re-issue build_stream with the right context.
@@ -444,7 +453,14 @@ fn host_thread(
                     volume: click_volume,
                 };
                 match build_stream(
-                    &host, &device, pad_channels, click_channels, cue_channels, master, click_init,
+                    &host,
+                    &device,
+                    pad_channels,
+                    click_channels,
+                    cue_channels,
+                    master,
+                    cue_volume,
+                    click_init,
                 ) {
                     Ok(stream) => {
                         last_host = host;
@@ -480,6 +496,7 @@ fn host_thread(
                     channels,
                     last_cue_channels,
                     master,
+                    cue_volume,
                     click_init,
                 ) {
                     Ok(stream) => {
@@ -512,6 +529,7 @@ fn host_thread(
                     last_click_channels,
                     channels,
                     master,
+                    cue_volume,
                     click_init,
                 ) {
                     Ok(stream) => {
@@ -606,6 +624,12 @@ fn host_thread(
                 master = v;
                 if let Some(act) = active.as_mut() {
                     let _ = act.cmd_tx.push(PlayCommand::SetMaster(v));
+                }
+            }
+            EngineCommand::SetCueVolume(v) => {
+                cue_volume = v;
+                if let Some(act) = active.as_mut() {
+                    let _ = act.cmd_tx.push(PlayCommand::SetCueVolume(v));
                 }
             }
             EngineCommand::SetCrossfade(ms) => {
@@ -720,6 +744,7 @@ fn build_stream(
     click_channels: (usize, usize),
     cue_channels: (usize, usize),
     master: f32,
+    cue_volume: f32,
     click_init: ClickInit,
 ) -> Result<ActiveStream, String> {
     let host = host_from_label(host_label)?;
@@ -767,6 +792,7 @@ fn build_stream(
                 click_bus,
                 cue_bus,
                 master,
+                cue_volume,
                 click_gen,
                 cmd_rx,
             );
@@ -781,6 +807,7 @@ fn build_stream(
                 click_bus,
                 cue_bus,
                 master,
+                cue_volume,
                 click_gen,
                 cmd_rx,
             );
@@ -1007,6 +1034,7 @@ fn mix_one_frame(voices: &mut Vec<Voice>, master: f32, cue_volume: f32) -> Mixed
 fn drain_commands(
     voices: &mut Vec<Voice>,
     master: &mut f32,
+    cue_volume: &mut f32,
     click: &mut ClickGen,
     cmd_rx: &mut rtrb::Consumer<PlayCommand>,
 ) {
@@ -1053,6 +1081,7 @@ fn drain_commands(
                 }
             }
             PlayCommand::SetMaster(m) => *master = m,
+            PlayCommand::SetCueVolume(v) => *cue_volume = v,
             PlayCommand::SetClickEnabled(en) => click.set_enabled(en),
             PlayCommand::SetClickBpm(bpm) => click.set_bpm(bpm),
             PlayCommand::SetClickBeats(b) => click.set_beats(b),
@@ -1129,18 +1158,17 @@ fn build_callback_f32(
     click_bus: BusRouting,
     cue_bus: BusRouting,
     master_init: f32,
+    cue_volume_init: f32,
     click_init: ClickGen,
     mut cmd_rx: rtrb::Consumer<PlayCommand>,
 ) -> impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut voices: Vec<Voice> = Vec::with_capacity(4);
     let mut master = master_init;
+    let mut cue_volume = cue_volume_init;
     let mut click = click_init;
-    // Cues run at their own volume — kept constant for now (user-adjustable
-    // via SetCueVolume in a follow-up if needed).
-    let cue_volume = 1.0_f32;
 
     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-        drain_commands(&mut voices, &mut master, &mut click, &mut cmd_rx);
+        drain_commands(&mut voices, &mut master, &mut cue_volume, &mut click, &mut cmd_rx);
 
         for frame in data.chunks_mut(total_channels) {
             let m = mix_one_frame(&mut voices, master, cue_volume);
@@ -1158,13 +1186,14 @@ fn build_callback_i32(
     click_bus: BusRouting,
     cue_bus: BusRouting,
     master_init: f32,
+    cue_volume_init: f32,
     click_init: ClickGen,
     mut cmd_rx: rtrb::Consumer<PlayCommand>,
 ) -> impl FnMut(&mut [i32], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut voices: Vec<Voice> = Vec::with_capacity(4);
     let mut master = master_init;
+    let mut cue_volume = cue_volume_init;
     let mut click = click_init;
-    let cue_volume = 1.0_f32;
 
     // i32 full-scale. Headroom of 1 sample on the negative side avoids wrap.
     const SCALE: f32 = 2_147_483_520.0;
@@ -1174,7 +1203,7 @@ fn build_callback_i32(
     let mut scratch = [0.0f32; 64];
 
     move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
-        drain_commands(&mut voices, &mut master, &mut click, &mut cmd_rx);
+        drain_commands(&mut voices, &mut master, &mut cue_volume, &mut click, &mut cmd_rx);
 
         for frame in data.chunks_mut(total_channels) {
             let m = mix_one_frame(&mut voices, master, cue_volume);
