@@ -1023,9 +1023,12 @@ fn mix_one_frame(voices: &mut Vec<Voice>, master: f32, cue_volume: f32) -> Mixed
                     m.cue_r += r * v.gain;
                 }
             }
-        } else if v.bus == VoiceBus::Cue && v.ended.load(Ordering::Relaxed) {
-            // Decoder is done and the ring is empty — start a quick fade so
-            // the voice drops out without a perceptible cut.
+        } else if v.ended.load(Ordering::Relaxed) {
+            // Decoder is done and the ring is empty — fade the voice out so it
+            // drops without a click. Applies to both cues (one-shot reached
+            // EOF) and pads (decoder hit an error like the file going missing
+            // mid-set — otherwise the voice would sit at full gain producing
+            // silence and wedge the "is this key playing?" check).
             v.target = 0.0;
             v.remove_when_silent = true;
         }
