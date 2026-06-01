@@ -16,6 +16,14 @@ const settings: Settings = {
   master_volume: 0.8,
   active_preset: FOLDER,
   server_port: 7777,
+  click: {
+    bpm: 90,
+    beats_per_bar: 4,
+    accent: true,
+    volume: 0.8,
+    channel_left: 2,
+    channel_right: 3,
+  },
   presets: [
     {
       id: FOLDER,
@@ -50,6 +58,12 @@ const now: NowPlaying = {
   preset: settings.active_preset,
   volume: settings.master_volume,
   playing: false,
+  click: {
+    enabled: false,
+    bpm: settings.click.bpm,
+    beats_per_bar: settings.click.beats_per_bar,
+    started_at_ms: null,
+  },
 };
 
 const devices: DeviceInfo[] = [
@@ -167,6 +181,32 @@ export async function mockInvoke<T>(cmd: string, args: Record<string, unknown> =
     }
     case "scan_library":
       return (preset() ?? settings.presets[0]) as T;
+    case "set_click_enabled":
+      now.click.enabled = !!a.enabled;
+      now.click.started_at_ms = now.click.enabled ? Date.now() : null;
+      emit();
+      return undefined as T;
+    case "set_click_bpm":
+      settings.click.bpm = a.bpm;
+      now.click.bpm = a.bpm;
+      emit();
+      return undefined as T;
+    case "set_click_beats":
+      settings.click.beats_per_bar = a.beats;
+      now.click.beats_per_bar = a.beats;
+      if (now.click.enabled) now.click.started_at_ms = Date.now();
+      emit();
+      return undefined as T;
+    case "set_click_accent":
+      settings.click.accent = !!a.accent;
+      return undefined as T;
+    case "set_click_volume":
+      settings.click.volume = a.volume;
+      return undefined as T;
+    case "set_click_channels":
+      settings.click.channel_left = a.channelLeft;
+      settings.click.channel_right = a.channelRight;
+      return undefined as T;
     default:
       return undefined as T;
   }

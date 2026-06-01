@@ -15,6 +15,12 @@ import {
   renamePreset,
   scanLibrary,
   setAudioOutput,
+  setClickAccent,
+  setClickBeats,
+  setClickBpm,
+  setClickChannels,
+  setClickEnabled,
+  setClickVolume,
   setCrossfade,
   setPreset,
   setVolume,
@@ -27,6 +33,8 @@ import {
   type Settings,
 } from "./lib/ipc";
 import {
+  BeatDots,
+  BpmDisplay,
   Card,
   Eyebrow,
   Icon,
@@ -37,6 +45,7 @@ import {
   SelectField,
   Segmented,
   Slider,
+  TapButton,
   Volume,
   type Note,
   type PadStyle,
@@ -86,6 +95,26 @@ function App() {
       unlisten.then((u) => u());
     };
   }, []);
+
+  // Keyboard: Space toggles click, T taps. Both ignored when a form control
+  // is focused so editing a bank name (etc.) isn't hijacked.
+  useEffect(() => {
+    function isTextTarget(el: EventTarget | null) {
+      if (!(el instanceof HTMLElement)) return false;
+      const tag = el.tagName;
+      return tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable;
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.repeat || isTextTarget(document.activeElement)) return;
+      if (e.code === "Space") {
+        e.preventDefault();
+        const next = !(now?.click?.enabled ?? false);
+        setClickEnabled(next).catch((err) => setError(String(err)));
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [now?.click?.enabled]);
 
   const activePreset = useMemo(
     () => settings?.presets.find((p) => p.id === settings.active_preset) ?? null,
@@ -349,6 +378,17 @@ function App() {
           </Card>
         </div>
 
+        {/* CLICK + (future) other transport cards */}
+        <div className="grid-click">
+          <ClickCard
+            settings={settings}
+            click={now?.click ?? null}
+            channelCount={channelCount}
+            onError={(e) => setError(String(e))}
+            onAfter={refreshSettings}
+          />
+        </div>
+
         {/* PAD LIBRARY */}
         <Card pad={22}>
           <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 16 }}>
@@ -554,6 +594,162 @@ function Bank({
         </div>
       )}
     </div>
+  );
+}
+
+/* ─────────────────────────── click card ───────────────────────────── */
+function ClickCard({
+  settings,
+  click,
+  channelCount,
+  onError,
+  onAfter,
+}: {
+  settings: Settings;
+  click: NowPlaying["click"] | null;
+  channelCount: number;
+  onError: (e: unknown) => void;
+  onAfter: () => Promise<void> | void;
+}) {
+  const enabled = click?.enabled ?? false;
+  // Show the live (broadcast) BPM/beats so taps land instantly; fall back to
+  // persisted settings before the first NowPlaying snapshot arrives.
+  const bpm = Math.round(click?.bpm ?? settings.click.bpm);
+  const beats = click?.beats_per_bar ?? settings.click.beats_per_bar;
+  const startedAt = click?.started_at_ms ?? null;
+
+  async function guard(fn: () => Promise<unknown>) {
+    try {
+      await fn();
+    } catch (e) {
+      onError(e);
+    }
+  }
+
+  return (
+    <Card pad={22}>
+      <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 8 }}>
+        <Icon name="metronome" size={17} stroke="var(--accent-ink)" />
+        <Eyebrow style={{ letterSpacing: "0.1em" }}>Click</Eyebrow>
+        <div style={{ flex: 1 }} />
+        <span className="mono" style={{ fontSize: 11.5, color: "var(--text-3)" }}>
+          Space = start/stop
+        </span>
+      </div>
+
+      <BpmDisplay
+        value={bpm}
+        onChange={(v) => guard(() => setClickBpm(v))}
+      />
+
+      <BeatDots
+        beatsPerBar={beats}
+        bpm={bpm}
+        startedAtMs={enabled ? startedAt : null}
+      />
+
+      <div className="click-row" style={{ justifyContent: "center", marginTop: 6 }}>
+        <Segmented<string>
+          value={String(beats)}
+          onChange={(v) => guard(() => setClickBeats(Number(v)))}
+          options={[
+            { key: "3", label: "3/4" },
+            { key: "4", label: "4/4" },
+            { key: "6", label: "6/8" },
+          ]}
+        />
+      </div>
+
+      <div style={{ marginTop: 14 }}>
+        <TapButton
+          big
+          onTap={(v) => guard(() => setClickBpm(v))}
+        />
+      </div>
+
+      <div className="click-row" style={{ marginTop: 18 }}>
+        <Icon name="speaker" size={17} stroke="var(--text-3)" />
+        <Slider
+          value={Math.round(settings.click.volume * 100)}
+          min={0}
+          max={100}
+          onChange={(v) =>
+            guard(async () => {
+              await setClickVolume(v / 100);
+              await onAfter();
+            })
+          }
+        />
+        <div className="vol-num">{Math.round(settings.click.volume * 100)}</div>
+      </div>
+
+      <div className="click-row" style={{ marginTop: 14, justifyContent: "space-between" }}>
+        <label className="click-toggle">
+          <input
+            type="checkbox"
+            checked={settings.click.accent}
+            onChange={(e) =>
+              guard(async () => {
+                await setClickAccent(e.target.checked);
+                await onAfter();
+              })
+            }
+          />
+          Accent on beat 1
+        </label>
+        <button
+          className={enabled ? "btn btn-danger" : "btn btn-accent"}
+          onClick={() => guard(() => setClickEnabled(!enabled))}
+        >
+          <Icon
+            name={enabled ? "stop" : "play"}
+            size={14}
+            stroke={enabled ? "var(--danger)" : "var(--on-accent)"}
+          />
+          {enabled ? "Stop click" : "Start click"}
+        </button>
+      </div>
+
+      <div className="click-row" style={{ marginTop: 18, gap: 12 }}>
+        <SelectField
+          label="Click L → ch"
+          mono
+          style={{ flex: 1 }}
+          value={String(settings.click.channel_left)}
+          options={Array.from({ length: channelCount }, (_, i) => ({
+            value: String(i),
+            label: String(i + 1),
+          }))}
+          onChange={(v) =>
+            guard(async () => {
+              await setClickChannels(Number(v), settings.click.channel_right);
+              await onAfter();
+            })
+          }
+        />
+        <SelectField
+          label="Click R → ch"
+          mono
+          style={{ flex: 1 }}
+          value={String(settings.click.channel_right)}
+          options={Array.from({ length: channelCount }, (_, i) => ({
+            value: String(i),
+            label: String(i + 1),
+          }))}
+          onChange={(v) =>
+            guard(async () => {
+              await setClickChannels(settings.click.channel_left, Number(v));
+              await onAfter();
+            })
+          }
+        />
+      </div>
+
+      <p className="helper-note">
+        Routes the click to a separate output pair on the same interface as the pads —
+        e.g. send pads to FOH and click to the band's IEM bus.
+      </p>
+    </Card>
   );
 }
 

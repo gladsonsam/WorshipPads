@@ -2,6 +2,7 @@
 // Visuals come from CSS tokens in App.css; these components add structure,
 // state, and real interactivity.
 
+import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 
 /* ── line icons (1.6 stroke, 20×20 viewbox) ───────────────────────── */
@@ -22,7 +23,11 @@ export type IconName =
   | "trash"
   | "copy"
   | "grid"
-  | "piano";
+  | "piano"
+  | "metronome"
+  | "play"
+  | "stop"
+  | "minus";
 
 export function Icon({
   name,
@@ -125,6 +130,16 @@ export function Icon({
         <path d="M7.3 4.5v11M10 4.5v11M12.7 4.5v11" />
       </g>
     ),
+    metronome: (
+      <g {...p}>
+        <path d="M6.2 4h7.6l2 13H4.2l2-13z" />
+        <path d="M5.5 12.5h9" />
+        <path d="M10 14.5l3-6.5" />
+      </g>
+    ),
+    play: <path d="M6 4l10 6-10 6V4z" {...p} />,
+    stop: <rect x="5" y="5" width="10" height="10" rx="1.6" {...p} />,
+    minus: <path d="M4 10h12" {...p} />,
   };
   return (
     <svg
@@ -444,6 +459,154 @@ export function PadCluster({
         );
       })}
     </div>
+  );
+}
+
+/* ── click: BPM display + steppers ─────────────────────────────────── */
+export function BpmDisplay({
+  value,
+  onChange,
+  min = 30,
+  max = 300,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+  min?: number;
+  max?: number;
+}) {
+  const clamp = (v: number) => Math.max(min, Math.min(max, Math.round(v)));
+  return (
+    <div className="bpm">
+      <button
+        type="button"
+        className="bpm-step"
+        title="−5 BPM"
+        onClick={() => onChange(clamp(value - 5))}
+      >
+        <Icon name="minus" size={16} stroke="var(--text-2)" />
+      </button>
+      <div className="bpm-num">
+        <span className="bpm-glyph">♩=</span>
+        <span className="bpm-val">{Math.round(value)}</span>
+      </div>
+      <button
+        type="button"
+        className="bpm-step"
+        title="+5 BPM"
+        onClick={() => onChange(clamp(value + 5))}
+      >
+        <Icon name="plus" size={16} stroke="var(--text-2)" />
+      </button>
+    </div>
+  );
+}
+
+/* ── click: beat dots, predict locally from started_at + bpm ──────── */
+export function BeatDots({
+  beatsPerBar,
+  bpm,
+  startedAtMs,
+  size = 10,
+}: {
+  beatsPerBar: number;
+  bpm: number;
+  /** Wall-clock unix ms when the click was last (re)started; null when off. */
+  startedAtMs: number | null;
+  size?: number;
+}) {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (startedAtMs == null) {
+      setTick(0);
+      return;
+    }
+    // setInterval, not requestAnimationFrame: RAF is suspended in background
+    // tabs and headless browsers (which leaves the dots frozen). 50 ms is
+    // smooth enough for a 4-dot indicator and costs near-nothing.
+    const id = window.setInterval(() => setTick((t) => t + 1), 50);
+    return () => window.clearInterval(id);
+  }, [startedAtMs]);
+
+  const live = startedAtMs != null && bpm > 0 && beatsPerBar > 0;
+  const current = live
+    ? Math.floor(((Date.now() - startedAtMs) * bpm) / 60_000) % beatsPerBar
+    : -1;
+
+  // touch `tick` so React keeps re-rendering during animation
+  void tick;
+
+  return (
+    <div className="beat-dots">
+      {Array.from({ length: Math.max(1, beatsPerBar) }).map((_, i) => (
+        <span
+          key={i}
+          className={`beat-dot${live && i === current ? " on" : ""}${i === 0 ? " one" : ""}`}
+          style={{ width: size, height: size }}
+        />
+      ))}
+    </div>
+  );
+}
+
+/* ── click: tap-tempo button ──────────────────────────────────────── */
+/**
+ * Maintains a rolling window of recent tap timestamps and reports a fresh BPM
+ * once we have ≥2 taps. A gap of >2 s resets the window (treated as a new
+ * attempt). Caller is responsible for actually committing the BPM upstream.
+ */
+export function TapButton({
+  onTap,
+  big = false,
+}: {
+  /** Called with the latest median-derived BPM, after the 2nd tap onward. */
+  onTap: (bpm: number) => void;
+  big?: boolean;
+}) {
+  const tapsRef = useRef<number[]>([]);
+  const [count, setCount] = useState(0);
+  const idleTimer = useRef<number | null>(null);
+
+  function tap() {
+    const now = performance.now();
+    const last = tapsRef.current[tapsRef.current.length - 1];
+    if (last != null && now - last > 2000) {
+      tapsRef.current = [];
+    }
+    tapsRef.current.push(now);
+    if (tapsRef.current.length > 5) tapsRef.current.shift();
+
+    if (tapsRef.current.length >= 2) {
+      const deltas: number[] = [];
+      for (let i = 1; i < tapsRef.current.length; i++) {
+        deltas.push(tapsRef.current[i] - tapsRef.current[i - 1]);
+      }
+      const sorted = [...deltas].sort((a, b) => a - b);
+      const median = sorted[Math.floor(sorted.length / 2)];
+      const bpm = Math.max(30, Math.min(300, 60_000 / median));
+      onTap(Math.round(bpm * 10) / 10);
+    }
+    setCount(tapsRef.current.length);
+
+    if (idleTimer.current != null) window.clearTimeout(idleTimer.current);
+    idleTimer.current = window.setTimeout(() => {
+      tapsRef.current = [];
+      setCount(0);
+    }, 2200);
+  }
+
+  let label = "TAP";
+  if (count === 1) label = "tap again…";
+  else if (count >= 2 && count < 4) label = `tap ${count} of 4…`;
+  else if (count >= 4) label = "TAP";
+
+  return (
+    <button
+      type="button"
+      className={`tap-btn${count > 0 ? " hot" : ""}${big ? " tap-btn--big" : ""}`}
+      onClick={tap}
+    >
+      {label}
+    </button>
   );
 }
 

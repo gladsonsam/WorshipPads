@@ -45,6 +45,15 @@ export interface Preset {
   unmapped: string[];
 }
 
+export interface ClickSettings {
+  bpm: number;
+  beats_per_bar: number;
+  accent: boolean;
+  volume: number;
+  channel_left: number;
+  channel_right: number;
+}
+
 export interface Settings {
   output_host: string;
   output_device: string | null;
@@ -55,6 +64,15 @@ export interface Settings {
   presets: Preset[];
   active_preset: string | null;
   server_port: number;
+  click: ClickSettings;
+}
+
+export interface ClickNow {
+  enabled: boolean;
+  bpm: number;
+  beats_per_bar: number;
+  /** unix-epoch ms when the click was last (re)started; null when stopped. */
+  started_at_ms: number | null;
 }
 
 export interface NowPlaying {
@@ -62,6 +80,7 @@ export interface NowPlaying {
   preset: string | null;
   volume: number;
   playing: boolean;
+  click: ClickNow;
 }
 
 export interface ServerUrl {
@@ -112,6 +131,25 @@ export const playKey = (key: Key) => invoke<void>("play_key", { key });
 export const stopPads = () => invoke<void>("stop");
 
 export const getServerUrl = () => invoke<ServerUrl>("server_url");
+
+/** Start or stop the click. Independent of pad transport. */
+export const setClickEnabled = (enabled: boolean) =>
+  invoke<void>("set_click_enabled", { enabled });
+
+export const setClickBpm = (bpm: number) =>
+  invoke<void>("set_click_bpm", { bpm });
+
+export const setClickBeats = (beats: number) =>
+  invoke<void>("set_click_beats", { beats });
+
+export const setClickAccent = (accent: boolean) =>
+  invoke<void>("set_click_accent", { accent });
+
+export const setClickVolume = (volume: number) =>
+  invoke<void>("set_click_volume", { volume });
+
+export const setClickChannels = (channelLeft: number, channelRight: number) =>
+  invoke<void>("set_click_channels", { channelLeft, channelRight });
 
 /** Subscribe to live now-playing updates pushed from the backend. */
 export const onNowPlaying = (cb: (n: NowPlaying) => void): Promise<UnlistenFn> => {
