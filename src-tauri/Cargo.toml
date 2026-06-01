@@ -1,6 +1,6 @@
 [package]
 name = "stagepal"
-version = "0.1.0"
+version = "0.1.1"
 description = "StagePal"
 authors = ["gladsonsam"]
 edition = "2021"

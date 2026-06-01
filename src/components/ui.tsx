@@ -4,6 +4,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
+import { useHoldRepeat } from "../shared/useHoldRepeat";
 
 /* ── line icons (1.6 stroke, 20×20 viewbox) ───────────────────────── */
 export type IconName =
@@ -471,6 +472,8 @@ export function PadCluster({
 }
 
 /* ── click: BPM display + steppers ─────────────────────────────────── */
+// Steppers: tap = ±1, hold = auto-repeat with acceleration.
+// Number: click to edit; Enter/blur commits, Esc cancels.
 export function BpmDisplay({
   value,
   onChange,
@@ -483,25 +486,84 @@ export function BpmDisplay({
   max?: number;
 }) {
   const clamp = (v: number) => Math.max(min, Math.min(max, Math.round(v)));
+  const apply = (v: number) => onChange(clamp(v));
+  const minusProps = useHoldRepeat(value, -1, apply);
+  const plusProps = useHoldRepeat(value, +1, apply);
+
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (editing && inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.select();
+    }
+  }, [editing]);
+
+  const startEdit = () => {
+    setDraft(String(Math.round(value)));
+    setEditing(true);
+  };
+  const commit = () => {
+    const n = Number(draft);
+    if (Number.isFinite(n) && draft.trim() !== "") onChange(clamp(n));
+    setEditing(false);
+  };
+
   return (
     <div className="bpm">
       <button
         type="button"
         className="bpm-step"
-        title="−5 BPM"
-        onClick={() => onChange(clamp(value - 5))}
+        title="−1 BPM (hold to ramp)"
+        aria-label="Decrease BPM"
+        {...minusProps}
       >
         <Icon name="minus" size={16} stroke="var(--text-2)" />
       </button>
-      <div className="bpm-num">
+      <div
+        className="bpm-num"
+        onClick={editing ? undefined : startEdit}
+        onKeyDown={(e) => {
+          if (editing) return;
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            startEdit();
+          }
+        }}
+        role="button"
+        tabIndex={editing ? -1 : 0}
+        title={editing ? undefined : "Click to type BPM"}
+      >
         <span className="bpm-glyph">♩=</span>
-        <span className="bpm-val">{Math.round(value)}</span>
+        {editing ? (
+          <input
+            ref={inputRef}
+            className="bpm-input"
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]*"
+            value={draft}
+            onChange={(e) =>
+              setDraft(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))
+            }
+            onBlur={commit}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commit();
+              else if (e.key === "Escape") setEditing(false);
+            }}
+          />
+        ) : (
+          <span className="bpm-val">{Math.round(value)}</span>
+        )}
       </div>
       <button
         type="button"
         className="bpm-step"
-        title="+5 BPM"
-        onClick={() => onChange(clamp(value + 5))}
+        title="+1 BPM (hold to ramp)"
+        aria-label="Increase BPM"
+        {...plusProps}
       >
         <Icon name="plus" size={16} stroke="var(--text-2)" />
       </button>

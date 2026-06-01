@@ -333,17 +333,8 @@ impl Default for ClickNow {
 /// to false when it finishes (or is stopped). `label` carries the saved quick
 /// cue's label so phones can highlight which button is currently speaking; it
 /// is None for free-form text speaks.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct CueNow {
     pub speaking: bool,
     pub label: Option<String>,
-}
-
-impl Default for CueNow {
-    fn default() -> Self {
-        CueNow {
-            speaking: false,
-            label: None,
-        }
-    }
 }

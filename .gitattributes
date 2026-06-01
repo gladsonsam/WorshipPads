@@ -1,0 +1,5 @@
+# Bundled/built remote UI shipped as a Tauri asset — not hand-written source.
+src-tauri/assets/remote.html linguist-generated=true
+
+# Vendored third-party ASIO SDK.
+src-tauri/third_party/** linguist-vendored=true

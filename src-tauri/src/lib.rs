@@ -32,6 +32,11 @@ fn show_main_window(app: &tauri::AppHandle) {
 /// Re-apply saved audio settings to the engine on boot. The click is restored
 /// in everything *except* its `enabled` state — we boot stopped so the user
 /// isn't surprised by a live click on launch.
+///
+/// Runs on a background thread (see `setup`) so a slow ASIO open doesn't pin
+/// the UI. Until this returns, `AudioEngine::has_active` is false, so any
+/// pad/cue press during the boot window surfaces "audio output not ready"
+/// instead of being silently dropped.
 fn restore_audio(app: &tauri::AppHandle) {
     let core = app.state::<CoreState>();
     let engine = app.state::<AudioEngine>();
@@ -111,8 +116,15 @@ pub fn run() {
                 .unwrap_or_else(|_| std::path::PathBuf::from("settings.json"));
             app.manage(CoreState::load(config_path));
 
-            // Re-bind the saved audio device/channels/volume.
-            restore_audio(app.handle());
+            // Re-bind the saved audio device/channels/volume on a background
+            // thread so a slow or hung audio driver can't block setup() from
+            // returning — the main window needs to show even when audio is
+            // misbehaving.
+            let app_for_restore = app.handle().clone();
+            std::thread::Builder::new()
+                .name("restore-audio".into())
+                .spawn(move || restore_audio(&app_for_restore))
+                .ok();
 
             // Pre-warm SAPI. The first PowerShell + System.Speech invocation
             // costs ~2–4 s on a cold system, which made the first auto-cue
@@ -130,9 +142,9 @@ pub fn run() {
                 })
                 .ok();
 
-            // Bridge the audio engine's upstream events (cue started / ended)
-            // to NowPlaying broadcasts so every connected client sees the
-            // `cue.speaking` flag flip when a cue finishes.
+            // Bridge the audio engine's upstream events to NowPlaying
+            // broadcasts so every connected client sees state flip when a
+            // cue or pad ends.
             let events = app.state::<AudioEngine>().events();
             let app_for_events = app.handle().clone();
             std::thread::Builder::new()
@@ -150,6 +162,20 @@ pub fn run() {
                                     let mut n = core.now.lock().unwrap();
                                     n.cue.speaking = false;
                                     n.cue.label = None;
+                                }
+                                commands::emit_now(&app_for_events, core.inner());
+                            }
+                            audio::EngineEvent::PadEnded => {
+                                // A pad voice exited unexpectedly (decoder
+                                // errored — file moved, share dropped). Flip
+                                // `playing` back to false so the next press of
+                                // the same key restarts playback instead of
+                                // hitting the deselect path.
+                                let core = app_for_events.state::<CoreState>();
+                                {
+                                    let mut n = core.now.lock().unwrap();
+                                    n.playing = false;
+                                    n.key = None;
                                 }
                                 commands::emit_now(&app_for_events, core.inner());
                             }

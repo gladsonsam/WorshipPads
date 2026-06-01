@@ -918,6 +918,27 @@ button {
   border: 1px solid var(--line);
   min-width: 168px;
   justify-content: center;
+  cursor: text;
+  transition: border-color 0.14s ease;
+}
+.bpm-num:hover {
+  border-color: var(--line-2);
+}
+.bpm-input {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  font-size: 44px;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  line-height: 1;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  padding: 0;
+  margin: 0;
+  width: 4ch;
+  text-align: left;
 }
 .bpm-glyph {
   font-family: var(--mono);

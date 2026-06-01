@@ -91,11 +91,11 @@ pub fn play_key_logic(
     // Auto-announce the new key. Best-effort: a synthesis hiccup mustn't
     // surface as a failed key press. The phrase is short enough that a single
     // letter at the saved rate flies past — render this one cue at a fixed
-    // slow rate (~-4) so "G" gets enough airtime to register, regardless of
+    // slow rate (~-3) so "G" gets enough airtime to register, regardless of
     // the user's saved rate for their own cues.
     if speak_key {
         let text = format!("Key of {}", k.spoken());
-        if let Err(e) = cue_speak_logic(app, core, engine, synth, &text, None, Some(-4)) {
+        if let Err(e) = cue_speak_logic(app, core, engine, synth, &text, None, Some(-3)) {
             eprintln!("[cue] auto key-announcement failed: {e}");
         }
     }
@@ -343,14 +343,29 @@ pub fn scan_library(
     folder: String,
     name: Option<String>,
 ) -> Result<Preset, String> {
-    let scanned = library::scan_preset(std::path::Path::new(&folder), name.clone())?;
+    // Preset id is just the folder path, so we can look up the existing entry
+    // without scanning the folder first. The filesystem scan runs OUTSIDE the
+    // Settings lock so other commands (assign_key, rename_preset, …) aren't
+    // blocked on it; the in-memory merge with manual mappings happens under
+    // the lock so concurrent edits during the scan aren't clobbered.
+    let folder_path = std::path::PathBuf::from(&folder);
+    let id = folder_path.to_string_lossy().to_string();
+
+    let preset_name = {
+        let s = core.settings.lock().unwrap();
+        name.clone()
+            .or_else(|| s.presets.iter().find(|p| p.id == id).map(|p| p.name.clone()))
+    };
+    let fresh = library::scan_preset(&folder_path, preset_name)?;
 
     let preset = {
         let mut s = core.settings.lock().unwrap();
-        // Re-scanning a folder already added preserves the user's manual mappings.
-        let merged = match s.presets.iter().find(|p| p.id == scanned.id) {
-            Some(existing) => library::rescan_preserving(existing, name)?,
-            None => scanned,
+        let merged = match s.presets.iter().find(|p| p.id == id) {
+            // Merge against the LATEST snapshot (post any mid-scan edits)
+            // rather than a stale clone — manual assignments made during the
+            // scan survive.
+            Some(current) => library::merge_scan(current, fresh),
+            None => fresh,
         };
         s.presets.retain(|p| p.id != merged.id);
         s.presets.push(merged.clone());

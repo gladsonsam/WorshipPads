@@ -41,8 +41,10 @@ pub struct Decoder {
 /// Spawn a decoder thread for `path`, producing interleaved-stereo f32 at `out_rate`.
 /// When `loop_when_eof` is true (pads), the decoder reopens the source on EOF
 /// for seamless looping. When false (one-shot cues / spoken WAVs), the decoder
-/// exits cleanly at EOF and flips `ended`.
-pub fn spawn(path: PathBuf, out_rate: u32, loop_when_eof: bool) -> Decoder {
+/// exits cleanly at EOF and flips `ended`. If `delete_on_exit` is true, `path`
+/// is removed after the decoder finishes — used for synthesized cue WAVs we
+/// own in %TEMP%.
+pub fn spawn(path: PathBuf, out_rate: u32, loop_when_eof: bool, delete_on_exit: bool) -> Decoder {
     // ~2 seconds of stereo headroom in the ring buffer.
     let capacity = (out_rate as usize * 2 * 2).max(16384);
     let (producer, consumer) = RingBuffer::<f32>::new(capacity);
@@ -56,6 +58,13 @@ pub fn spawn(path: PathBuf, out_rate: u32, loop_when_eof: bool) -> Decoder {
         .spawn(move || {
             if let Err(e) = decode_loop(&path, out_rate, producer, &stop_thread, loop_when_eof) {
                 eprintln!("[audio] decoder for {path:?} stopped: {e}");
+            }
+            if delete_on_exit {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        eprintln!("[audio] could not delete cue file {path:?}: {e}");
+                    }
+                }
             }
             ended_thread.store(true, Ordering::Relaxed);
         })
