@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { NowPlaying } from "../../shared/types";
 import { useHoldRepeat } from "../../shared/useHoldRepeat";
 import { post } from "../api";
+import { useServerClockOffset } from "../hooks/useServerClockOffset";
 import { MinusIcon, PlusIcon, VolumeIcon } from "./icons";
 
 const clampBpm = (v: number) => Math.max(30, Math.min(300, Math.round(v)));
@@ -14,6 +15,7 @@ export function ClickTab({ now }: Props) {
   const bpm = Math.round(now.click?.bpm ?? 90);
   const beats = now.click?.beats_per_bar ?? 4;
   const enabled = !!now.click?.enabled;
+  const clockOffset = useServerClockOffset();
 
   return (
     <section className="tab-body" role="tabpanel" aria-label="Click">
@@ -24,6 +26,7 @@ export function ClickTab({ now }: Props) {
         bpm={now.click?.bpm ?? 90}
         startedAt={now.click?.started_at_ms ?? null}
         enabled={enabled}
+        clockOffset={clockOffset}
       />
 
       <div className="ts-row">
@@ -68,19 +71,9 @@ export function ClickTab({ now }: Props) {
 }
 
 function BpmBlock({ bpm }: { bpm: number }) {
-  const bpmRef = useRef(bpm);
-  bpmRef.current = bpm;
-  const startRef = useRef(0);
   const sendBpm = (v: number) => post("/api/click/bpm", { bpm: clampBpm(v) });
-
-  const minusProps = useHoldRepeat((n) => {
-    if (n === 1) startRef.current = bpmRef.current;
-    sendBpm(startRef.current - n);
-  });
-  const plusProps = useHoldRepeat((n) => {
-    if (n === 1) startRef.current = bpmRef.current;
-    sendBpm(startRef.current + n);
-  });
+  const minusProps = useHoldRepeat(bpm, -1, sendBpm);
+  const plusProps = useHoldRepeat(bpm, +1, sendBpm);
 
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -116,6 +109,13 @@ function BpmBlock({ bpm }: { bpm: number }) {
       <div
         className="bpm-pill"
         onClick={editing ? undefined : startEdit}
+        onKeyDown={(e) => {
+          if (editing) return;
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            startEdit();
+          }
+        }}
         role="button"
         tabIndex={editing ? -1 : 0}
       >
@@ -157,45 +157,54 @@ function BpmBlock({ bpm }: { bpm: number }) {
  * Beat dots that pulse on the active beat. Computed from the server-stamped
  * started_at_ms + local clock so playback indication doesn't rely on per-tick
  * WS frames. Uses setInterval (not RAF) so it keeps ticking in background tabs.
+ *
+ * `clockOffset` (server clock − device clock, in ms) is added to Date.now()
+ * so phones whose wall clock drifts from the host don't show offset dots.
+ *
+ * The active dot is rendered into the JSX className (not poked onto the DOM
+ * imperatively) so parent re-renders — which arrive on every WS frame — can't
+ * momentarily wipe the highlight. The `.one` accent on beat 1 lives in the
+ * same string, so it's always present too.
  */
 function BeatDots({
   beats,
   bpm,
   startedAt,
   enabled,
+  clockOffset,
 }: {
   beats: number;
   bpm: number;
   startedAt: number | null;
   enabled: boolean;
+  clockOffset: number;
 }) {
-  const containerRef = useRef<HTMLDivElement>(null);
-
+  const [, setTick] = useState(0);
   useEffect(() => {
-    const paint = () => {
-      const el = containerRef.current;
-      if (!el) return;
-      const dots = el.children;
-      if (!enabled || !startedAt || !bpm) {
-        for (let i = 0; i < dots.length; i++) dots[i].classList.remove("on");
-        return;
-      }
-      const idx =
-        Math.floor(((Date.now() - startedAt) * bpm) / 60000) % Math.max(1, beats);
-      for (let i = 0; i < dots.length; i++) {
-        dots[i].classList.toggle("on", i === idx);
-      }
-    };
-    paint();
-    if (!enabled) return;
-    const id = window.setInterval(paint, 50);
+    if (!enabled || !startedAt) return;
+    const id = window.setInterval(() => setTick((t) => t + 1), 50);
     return () => window.clearInterval(id);
-  }, [enabled, startedAt, bpm, beats]);
+  }, [enabled, startedAt]);
+
+  const live = enabled && startedAt != null && bpm > 0;
+  // ((x % n) + n) % n so a slightly-negative elapsed (device clock briefly
+  // ahead of server, or clockOffset still settling) wraps cleanly to the
+  // last dot instead of producing a negative index that matches nothing.
+  const beatsN = Math.max(1, beats);
+  const current = live
+    ? ((Math.floor(((Date.now() + clockOffset - startedAt) * bpm) / 60_000) %
+        beatsN) +
+        beatsN) %
+      beatsN
+    : -1;
 
   return (
-    <div className="beat-dots" ref={containerRef}>
+    <div className="beat-dots">
       {Array.from({ length: Math.max(1, beats) }).map((_, i) => (
-        <span key={i} className={`dot${i === 0 ? " one" : ""}`} />
+        <span
+          key={i}
+          className={`dot${i === 0 ? " one" : ""}${i === current ? " on" : ""}`}
+        />
       ))}
     </div>
   );

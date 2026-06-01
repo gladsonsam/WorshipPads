@@ -24,14 +24,25 @@ use serde::Serialize;
 
 /// Upper bound on how long the caller waits for a stream rebuild. ASIO opens
 /// can be slow but should never legitimately exceed this; a broken driver that
-/// hangs longer would otherwise freeze the UI permanently.
+/// hangs longer would otherwise freeze the UI permanently. Note: when a prior
+/// build_stream is mid-flight the host thread is single-threaded, so a queued
+/// request may time out before the host even starts on it — the error message
+/// is intentionally vague about whose fault it is.
 const STREAM_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn await_stream_reply(rx: &Receiver<Result<(), String>>) -> Result<(), String> {
+fn await_stream_reply(rx: &Receiver<Result<(), String>>, busy: bool) -> Result<(), String> {
     match rx.recv_timeout(STREAM_BUILD_TIMEOUT) {
         Ok(r) => r,
         Err(RecvTimeoutError::Timeout) => {
-            Err("audio device took too long to open — driver may be hung".into())
+            if busy {
+                // A previous device open is still running; the host thread
+                // hasn't even reached this request yet. Don't blame the device
+                // the user just picked — they may still get a successful open
+                // once the prior call returns.
+                Err("audio output is still opening a previous device — please wait or restart the app".into())
+            } else {
+                Err("audio device took too long to open — driver may be hung".into())
+            }
         }
         Err(RecvTimeoutError::Disconnected) => Err("audio host thread did not reply".into()),
     }
@@ -154,12 +165,34 @@ enum EngineCommand {
     SetDuckClick(bool),
 }
 
+/// Internal messages sent from watcher threads back into the host thread.
+/// Kept separate from `EngineCommand` so the public command channel can
+/// disconnect cleanly when `AudioEngine` is dropped — if host_thread held a
+/// clone of the public Sender, the channel would stay open forever.
+enum HostNotify {
+    /// Posted by the cue-watcher thread when a cue finishes naturally. Carries
+    /// the cue generation so the loop can ignore stale watchers (cue replaced
+    /// or stopped before this fired). Routing it through the host (not
+    /// straight to the upstream `events` channel) is what lets the loop clear
+    /// `cue_active` and lift the click duck before broadcasting CueEnded.
+    CueEnded(u64),
+    /// Posted by the pad-watcher thread when a pad decoder exits. The host
+    /// only emits a `PadEnded` event if the generation still matches — that
+    /// way crossfades and explicit Stop calls (which also flip the decoder's
+    /// `ended` flag) don't fire a redundant pad-ended event.
+    PadEnded(u64),
+}
+
 /// Events the engine pushes upstream so commands.rs can broadcast NowPlaying
-/// edges (cue started/ended) without polling.
+/// edges (cue/pad started/ended) without polling.
 #[derive(Clone, Copy, Debug)]
 pub enum EngineEvent {
     CueStarted,
     CueEnded,
+    /// The currently-playing pad voice exited unexpectedly (decoder errored —
+    /// file moved, share dropped). Lets commands.rs flip `now.playing` back
+    /// to false so the "is this key playing?" check doesn't wedge.
+    PadEnded,
 }
 
 /// Control handle. Cheap to clone-share via Tauri state.
@@ -168,6 +201,13 @@ pub struct AudioEngine {
     /// Events from the engine to anyone who wants them (one consumer at a
     /// time; commands.rs owns the receive side).
     events_rx: crossbeam_channel::Receiver<EngineEvent>,
+    /// True once a stream is up. Read synchronously by `play` / `play_cue`
+    /// so the caller gets an honest error (instead of a silent drop) when the
+    /// engine is still booting or after a device-open failure.
+    has_active: Arc<AtomicBool>,
+    /// True while the host thread is mid-`build_stream`. Used to attribute
+    /// timeouts correctly when a second SetOutput is queued behind a hung one.
+    build_in_progress: Arc<AtomicBool>,
 }
 
 impl Default for AudioEngine {
@@ -179,12 +219,19 @@ impl Default for AudioEngine {
 impl AudioEngine {
     pub fn new() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
+        let (notify_tx, notify_rx) = crossbeam_channel::unbounded::<HostNotify>();
         let (events_tx, events_rx) = crossbeam_channel::unbounded();
+        let has_active = Arc::new(AtomicBool::new(false));
+        let build_in_progress = Arc::new(AtomicBool::new(false));
+        let has_active_t = has_active.clone();
+        let build_in_progress_t = build_in_progress.clone();
         std::thread::Builder::new()
             .name("audio-host".into())
-            .spawn(move || host_thread(rx, events_tx))
+            .spawn(move || {
+                host_thread(rx, notify_rx, notify_tx, events_tx, has_active_t, build_in_progress_t)
+            })
             .expect("failed to spawn audio host thread");
-        AudioEngine { tx, events_rx }
+        AudioEngine { tx, events_rx, has_active, build_in_progress }
     }
 
     /// Borrow the upstream event stream. Cloneable (crossbeam Receiver),
@@ -244,6 +291,7 @@ impl AudioEngine {
         cue_channels: (usize, usize),
     ) -> Result<(), String> {
         let (reply, reply_rx) = crossbeam_channel::bounded(1);
+        let busy = self.build_in_progress.load(Ordering::Relaxed);
         self.tx
             .send(EngineCommand::SetOutput {
                 host: host.to_string(),
@@ -254,23 +302,25 @@ impl AudioEngine {
                 reply,
             })
             .map_err(|_| "audio host thread is gone".to_string())?;
-        await_stream_reply(&reply_rx)
+        await_stream_reply(&reply_rx, busy)
     }
 
     pub fn set_click_channels(&self, channels: (usize, usize)) -> Result<(), String> {
         let (reply, reply_rx) = crossbeam_channel::bounded(1);
+        let busy = self.build_in_progress.load(Ordering::Relaxed);
         self.tx
             .send(EngineCommand::SetClickChannels { channels, reply })
             .map_err(|_| "audio host thread is gone".to_string())?;
-        await_stream_reply(&reply_rx)
+        await_stream_reply(&reply_rx, busy)
     }
 
     pub fn set_cue_channels(&self, channels: (usize, usize)) -> Result<(), String> {
         let (reply, reply_rx) = crossbeam_channel::bounded(1);
+        let busy = self.build_in_progress.load(Ordering::Relaxed);
         self.tx
             .send(EngineCommand::SetCueChannels { channels, reply })
             .map_err(|_| "audio host thread is gone".to_string())?;
-        await_stream_reply(&reply_rx)
+        await_stream_reply(&reply_rx, busy)
     }
 
     pub fn set_click_enabled(&self, enabled: bool) -> Result<(), String> {
@@ -304,6 +354,9 @@ impl AudioEngine {
     }
 
     pub fn play(&self, path: PathBuf) -> Result<(), String> {
+        if !self.has_active.load(Ordering::Relaxed) {
+            return Err("audio output not ready — set or restore an output device first".into());
+        }
         self.tx
             .send(EngineCommand::Play(path))
             .map_err(|_| "audio host thread is gone".to_string())
@@ -316,6 +369,14 @@ impl AudioEngine {
     }
 
     pub fn play_cue(&self, path: PathBuf) -> Result<(), String> {
+        if !self.has_active.load(Ordering::Relaxed) {
+            // Caller (e.g. cue_speak_logic) just synthesized this WAV to
+            // %TEMP%; if we don't take ownership of it, it will leak —
+            // decode::spawn would normally delete it after playback, but we
+            // never get that far. Best-effort delete here.
+            let _ = std::fs::remove_file(&path);
+            return Err("audio output not ready — set or restore an output device first".into());
+        }
         self.tx
             .send(EngineCommand::PlayCue(path))
             .map_err(|_| "audio host thread is gone".to_string())
@@ -425,7 +486,11 @@ fn best_output_summary(device: &cpal::Device) -> Option<(usize, u32)> {
 
 fn host_thread(
     rx: Receiver<EngineCommand>,
+    notify_rx: Receiver<HostNotify>,
+    notify_tx: Sender<HostNotify>,
     events: crossbeam_channel::Sender<EngineEvent>,
+    has_active: Arc<AtomicBool>,
+    build_in_progress: Arc<AtomicBool>,
 ) {
     let mut active: Option<ActiveStream> = None;
     let mut master: f32 = 0.8;
@@ -458,9 +523,28 @@ fn host_thread(
     // replaced or stopped cue) from clearing the "speaking" badge while a
     // newer cue is still audible.
     let cue_generation = Arc::new(AtomicU64::new(0));
+    // Same idea for pads — incremented on each Play / Stop / Crossfade /
+    // stream rebuild, so a pad watcher only reports its decoder's exit if
+    // the voice it was tracking is still the current pad.
+    let pad_generation = Arc::new(AtomicU64::new(0));
 
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
+    // Receive on both the public command channel and the internal notify
+    // channel. When AudioEngine is dropped, the public channel disconnects
+    // and we exit; the notify channel stays open (host owns the sender) but
+    // that's fine — there's nothing left to drive it.
+    loop {
+        use crossbeam_channel::Select;
+        let mut sel = Select::new();
+        let cmd_idx = sel.recv(&rx);
+        let notify_idx = sel.recv(&notify_rx);
+        let oper = sel.select();
+        let i = oper.index();
+        if i == cmd_idx {
+            let cmd = match oper.recv(&rx) {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            match cmd {
             EngineCommand::SetOutput {
                 host,
                 device,
@@ -481,16 +565,40 @@ fn host_thread(
                     click: click_channels,
                     cue: cue_channels,
                 };
-                match build_stream(&host, &device, channels, master, cue_volume, click_init) {
+                build_in_progress.store(true, Ordering::Relaxed);
+                let result = build_stream(&host, &device, channels, master, cue_volume, click_init);
+                build_in_progress.store(false, Ordering::Relaxed);
+                match result {
                     Ok(stream) => {
+                        // Replacing the old stream drops it and every voice it
+                        // was carrying. Invalidate any orphan pad/cue watcher,
+                        // flush playing-state immediately (don't wait for the
+                        // ~300ms watcher tail), and re-apply the cue duck on
+                        // the freshly-built stream so a mid-cue rebuild
+                        // doesn't slam the click back to full volume.
+                        pad_generation.fetch_add(1, Ordering::Relaxed);
+                        cue_generation.fetch_add(1, Ordering::Relaxed);
+                        if cue_active {
+                            cue_active = false;
+                            let _ = events.send(EngineEvent::CueEnded);
+                        }
                         last_host = host;
                         last_device = device;
                         last_channels = channels;
                         active = Some(stream);
+                        has_active.store(true, Ordering::Relaxed);
                         let _ = reply.send(Ok(()));
                     }
                     Err(e) => {
                         active = None;
+                        has_active.store(false, Ordering::Relaxed);
+                        // The device that just failed isn't worth retrying for
+                        // subsequent channel-only edits — clear `last_*` so the
+                        // next SetClickChannels/SetCueChannels short-circuits
+                        // with an honest "no device" response instead of
+                        // re-running the same failure under the hood.
+                        last_host.clear();
+                        last_device.clear();
                         let _ = reply.send(Err(e));
                     }
                 }
@@ -508,14 +616,27 @@ fn host_thread(
                     volume: click_volume,
                 };
                 let next = ChannelLayout { click: channels, ..last_channels };
-                match build_stream(&last_host, &last_device, next, master, cue_volume, click_init) {
+                build_in_progress.store(true, Ordering::Relaxed);
+                let result = build_stream(&last_host, &last_device, next, master, cue_volume, click_init);
+                build_in_progress.store(false, Ordering::Relaxed);
+                match result {
                     Ok(stream) => {
+                        pad_generation.fetch_add(1, Ordering::Relaxed);
+                        cue_generation.fetch_add(1, Ordering::Relaxed);
+                        if cue_active {
+                            cue_active = false;
+                            let _ = events.send(EngineEvent::CueEnded);
+                        }
                         last_channels = next;
                         active = Some(stream);
+                        has_active.store(true, Ordering::Relaxed);
                         let _ = reply.send(Ok(()));
                     }
                     Err(e) => {
                         active = None;
+                        has_active.store(false, Ordering::Relaxed);
+                        last_host.clear();
+                        last_device.clear();
                         let _ = reply.send(Err(e));
                     }
                 }
@@ -533,14 +654,27 @@ fn host_thread(
                     volume: click_volume,
                 };
                 let next = ChannelLayout { cue: channels, ..last_channels };
-                match build_stream(&last_host, &last_device, next, master, cue_volume, click_init) {
+                build_in_progress.store(true, Ordering::Relaxed);
+                let result = build_stream(&last_host, &last_device, next, master, cue_volume, click_init);
+                build_in_progress.store(false, Ordering::Relaxed);
+                match result {
                     Ok(stream) => {
+                        pad_generation.fetch_add(1, Ordering::Relaxed);
+                        cue_generation.fetch_add(1, Ordering::Relaxed);
+                        if cue_active {
+                            cue_active = false;
+                            let _ = events.send(EngineEvent::CueEnded);
+                        }
                         last_channels = next;
                         active = Some(stream);
+                        has_active.store(true, Ordering::Relaxed);
                         let _ = reply.send(Ok(()));
                     }
                     Err(e) => {
                         active = None;
+                        has_active.store(false, Ordering::Relaxed);
+                        last_host.clear();
+                        last_device.clear();
                         let _ = reply.send(Err(e));
                     }
                 }
@@ -551,7 +685,7 @@ fn host_thread(
                     let voice = Voice {
                         consumer: dec.consumer,
                         stop: dec.stop,
-                        ended: dec.ended,
+                        ended: dec.ended.clone(),
                         bus: VoiceBus::Pad,
                         gain: 0.0,
                         target: 1.0,
@@ -559,12 +693,40 @@ fn host_thread(
                         remove_when_silent: false,
                     };
                     let _ = act.cmd_tx.push(PlayCommand::Crossfade(voice));
+                    // Bump the pad generation, then spawn a watcher tied to
+                    // this generation. If the decoder later exits for any
+                    // reason — natural crossfade-stop, explicit Stop, or an
+                    // error mid-set — the host will see NotifyPadEnded.
+                    // The host only emits EngineEvent::PadEnded when the
+                    // generation still matches: a crossfade or Stop bumps the
+                    // generation first, so those legitimate exits stay quiet.
+                    let my_gen = pad_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                    let watcher_ended = dec.ended;
+                    let watcher_notify = notify_tx.clone();
+                    let watcher_gen_arc = pad_generation.clone();
+                    std::thread::Builder::new()
+                        .name("pad-watcher".into())
+                        .spawn(move || {
+                            while !watcher_ended.load(Ordering::Relaxed) {
+                                std::thread::sleep(Duration::from_millis(200));
+                            }
+                            // Skip post if the pad has already been replaced
+                            // (saves a no-op trip through the host loop).
+                            if watcher_gen_arc.load(Ordering::Relaxed) == my_gen {
+                                let _ = watcher_notify.send(HostNotify::PadEnded(my_gen));
+                            }
+                        })
+                        .ok();
                 } else {
                     eprintln!("[audio] Play ignored: no output device configured");
                 }
             }
             EngineCommand::Stop => {
                 if let Some(act) = active.as_mut() {
+                    // Invalidate the current pad watcher so its eventual
+                    // PadEnded post is ignored — the user initiated the stop,
+                    // they don't need a redundant "pad ended" event.
+                    pad_generation.fetch_add(1, Ordering::Relaxed);
                     let step = fade_step(crossfade_ms, act.out_rate);
                     let _ = act.cmd_tx.push(PlayCommand::FadeOutAll(step));
                 }
@@ -572,6 +734,11 @@ fn host_thread(
             EngineCommand::PlayCue(path) => {
                 let Some(act) = active.as_mut() else {
                     eprintln!("[audio] PlayCue ignored: no output device configured");
+                    // The synthesized temp WAV would normally be deleted by
+                    // decode::spawn's thread on exit (delete_on_exit=true).
+                    // We never reach that path here, so clean up directly
+                    // instead of leaking the file in %TEMP%.
+                    let _ = std::fs::remove_file(&path);
                     continue;
                 };
                 let dec = decode::spawn(path, act.out_rate, false, true);
@@ -595,14 +762,13 @@ fn host_thread(
                     let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(true));
                 }
                 // Watcher: when the decoder signals "ended", give the audio
-                // buffer ~300 ms to drain, then notify upstream so NowPlaying
-                // can flip `speaking` back to false. The generation check at
-                // the end skips the notification if a newer cue has since
-                // taken over — otherwise the old watcher would clear the
-                // badge mid-way through the replacement cue.
-                let watcher_events = events.clone();
+                // buffer ~300 ms to drain, then post a notification back to
+                // the engine loop. Routing through the internal notify
+                // channel (not straight to `events`) is what lets the loop
+                // clear `cue_active` and lift the click duck before
+                // broadcasting CueEnded.
                 let watcher_ended = dec.ended;
-                let watcher_gen = cue_generation.clone();
+                let watcher_notify = notify_tx.clone();
                 std::thread::Builder::new()
                     .name("cue-watcher".into())
                     .spawn(move || {
@@ -610,9 +776,7 @@ fn host_thread(
                             std::thread::sleep(Duration::from_millis(100));
                         }
                         std::thread::sleep(Duration::from_millis(300));
-                        if watcher_gen.load(Ordering::Relaxed) == my_gen {
-                            let _ = watcher_events.send(EngineEvent::CueEnded);
-                        }
+                        let _ = watcher_notify.send(HostNotify::CueEnded(my_gen));
                     })
                     .ok();
             }
@@ -682,6 +846,43 @@ fn host_thread(
                 duck_click_pref = pref;
                 if let Some(act) = active.as_mut() {
                     let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(pref && cue_active));
+                }
+            }
+            }
+        } else if i == notify_idx {
+            let n = match oper.recv(&notify_rx) {
+                Ok(n) => n,
+                // Host owns a sender, so this branch shouldn't fire — but if
+                // it ever does, treat it the same as the command-side close.
+                Err(_) => break,
+            };
+            match n {
+                HostNotify::CueEnded(gen) => {
+                    // Stale watcher (cue was replaced or stopped before this
+                    // fired) — the newer path already handled state, so ignore.
+                    if cue_generation.load(Ordering::Relaxed) != gen || !cue_active {
+                        continue;
+                    }
+                    cue_active = false;
+                    if duck_click_pref {
+                        if let Some(act) = active.as_mut() {
+                            let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(false));
+                        }
+                    }
+                    let _ = events.send(EngineEvent::CueEnded);
+                }
+                HostNotify::PadEnded(gen) => {
+                    // Stale (a crossfade/stop/rebuild already bumped the
+                    // generation) — that path either replaced the voice with
+                    // a fresh one or intentionally stopped it.
+                    if pad_generation.load(Ordering::Relaxed) != gen {
+                        continue;
+                    }
+                    // Same generation: the decoder exited unexpectedly. Bump
+                    // the generation so subsequent state changes don't fire
+                    // again for the same voice.
+                    pad_generation.fetch_add(1, Ordering::Relaxed);
+                    let _ = events.send(EngineEvent::PadEnded);
                 }
             }
         }

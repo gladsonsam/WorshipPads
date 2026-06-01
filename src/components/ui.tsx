@@ -486,18 +486,9 @@ export function BpmDisplay({
   max?: number;
 }) {
   const clamp = (v: number) => Math.max(min, Math.min(max, Math.round(v)));
-  const valueRef = useRef(value);
-  valueRef.current = value;
-  const startRef = useRef(0);
-
-  const minusProps = useHoldRepeat((n) => {
-    if (n === 1) startRef.current = Math.round(valueRef.current);
-    onChange(clamp(startRef.current - n));
-  });
-  const plusProps = useHoldRepeat((n) => {
-    if (n === 1) startRef.current = Math.round(valueRef.current);
-    onChange(clamp(startRef.current + n));
-  });
+  const apply = (v: number) => onChange(clamp(v));
+  const minusProps = useHoldRepeat(value, -1, apply);
+  const plusProps = useHoldRepeat(value, +1, apply);
 
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -534,6 +525,15 @@ export function BpmDisplay({
       <div
         className="bpm-num"
         onClick={editing ? undefined : startEdit}
+        onKeyDown={(e) => {
+          if (editing) return;
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            startEdit();
+          }
+        }}
+        role="button"
+        tabIndex={editing ? -1 : 0}
         title={editing ? undefined : "Click to type BPM"}
       >
         <span className="bpm-glyph">♩=</span>

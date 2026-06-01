@@ -344,30 +344,36 @@ pub fn scan_library(
     name: Option<String>,
 ) -> Result<Preset, String> {
     // Preset id is just the folder path, so we can look up the existing entry
-    // without scanning the folder first. The actual filesystem scan runs
-    // OUTSIDE the Settings lock so other commands aren't blocked on it.
+    // without scanning the folder first. The filesystem scan runs OUTSIDE the
+    // Settings lock so other commands (assign_key, rename_preset, …) aren't
+    // blocked on it; the in-memory merge with manual mappings happens under
+    // the lock so concurrent edits during the scan aren't clobbered.
     let folder_path = std::path::PathBuf::from(&folder);
     let id = folder_path.to_string_lossy().to_string();
 
-    let existing = {
+    let preset_name = {
         let s = core.settings.lock().unwrap();
-        s.presets.iter().find(|p| p.id == id).cloned()
+        name.clone()
+            .or_else(|| s.presets.iter().find(|p| p.id == id).map(|p| p.name.clone()))
     };
+    let fresh = library::scan_preset(&folder_path, preset_name)?;
 
-    // Re-scanning a folder already added preserves the user's manual mappings.
-    let preset = match existing {
-        Some(e) => library::rescan_preserving(&e, name)?,
-        None => library::scan_preset(&folder_path, name)?,
-    };
-
-    {
+    let preset = {
         let mut s = core.settings.lock().unwrap();
-        s.presets.retain(|p| p.id != preset.id);
-        s.presets.push(preset.clone());
+        let merged = match s.presets.iter().find(|p| p.id == id) {
+            // Merge against the LATEST snapshot (post any mid-scan edits)
+            // rather than a stale clone — manual assignments made during the
+            // scan survive.
+            Some(current) => library::merge_scan(current, fresh),
+            None => fresh,
+        };
+        s.presets.retain(|p| p.id != merged.id);
+        s.presets.push(merged.clone());
         if s.active_preset.is_none() {
-            s.active_preset = Some(preset.id.clone());
+            s.active_preset = Some(merged.id.clone());
         }
-    }
+        merged
+    };
     core.save()?;
     Ok(preset)
 }

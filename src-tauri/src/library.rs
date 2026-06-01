@@ -99,7 +99,14 @@ pub fn scan_preset(folder: &Path, name: Option<String>) -> Result<Preset, String
 /// are kept, and anything new-but-ambiguous lands in `unmapped`.
 pub fn rescan_preserving(old: &Preset, name: Option<String>) -> Result<Preset, String> {
     let fresh = scan_preset(&old.folder, name.or_else(|| Some(old.name.clone())))?;
+    Ok(merge_scan(old, fresh))
+}
 
+/// Pure in-memory merge of a freshly-scanned preset onto an existing one's
+/// manual mappings. Split from `rescan_preserving` so callers can run the
+/// slow filesystem scan outside their settings lock and then reconcile
+/// against the (possibly concurrently-mutated) live state under the lock.
+pub fn merge_scan(old: &Preset, fresh: Preset) -> Preset {
     // The full set of audio files currently on disk.
     let universe: Vec<PathBuf> = fresh
         .files
@@ -124,9 +131,9 @@ pub fn rescan_preserving(old: &Preset, name: Option<String>) -> Result<Preset, S
     unmapped.sort();
     unmapped.dedup();
 
-    Ok(Preset {
+    Preset {
         unmapped,
         files,
         ..fresh
-    })
+    }
 }
