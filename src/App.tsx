@@ -33,6 +33,13 @@ const PAGE_KEY = "stagepal.page";
 type Page = "pads" | "click" | "cues" | "library" | "settings";
 const PAGES: Page[] = ["pads", "click", "cues", "library", "settings"];
 
+// Phone-remote address: prefer the raw LAN IP, fall back to the mDNS .local name.
+function phoneAddress(server: ServerUrl | null): { url: string; addr: string } {
+  if (!server) return { url: "", addr: "" };
+  const addr = `${server.ip || `${server.host}.local`}:${server.port}`;
+  return { url: `http://${addr}`, addr };
+}
+
 function App() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
@@ -135,16 +142,7 @@ function App() {
     }
   }
 
-  const phoneUrl = server
-    ? server.ip
-      ? `http://${server.ip}:${server.port}`
-      : `http://${server.host}.local:${server.port}`
-    : "";
-  const phoneAddr = server
-    ? server.ip
-      ? `${server.ip}:${server.port}`
-      : `${server.host}.local:${server.port}`
-    : "";
+  const { url: phoneUrl, addr: phoneAddr } = phoneAddress(server);
 
   if (!settings) {
     return (
