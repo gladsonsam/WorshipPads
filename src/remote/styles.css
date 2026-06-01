@@ -38,12 +38,13 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 100vh;
+  min-height: 100dvh;
   max-width: 460px;
   margin: 0 auto;
   /* Top padding hugs the safe-area inset; only the notch decides how tall it
      gets. A small base keeps the transport above the fold on shorter phones. */
-  padding: calc(env(safe-area-inset-top) + 14px) 18px
-    calc(env(safe-area-inset-bottom) + 18px);
+  padding: calc(env(safe-area-inset-top) + 12px) 16px
+    calc(env(safe-area-inset-bottom) + 14px);
 }
 @keyframes meterPulse {
   0%,
@@ -338,7 +339,7 @@ h1 {
   display: flex;
   align-items: center;
   gap: 12px;
-  margin-bottom: 14px;
+  margin-bottom: 10px;
 }
 .field {
   position: relative;
@@ -399,14 +400,16 @@ h1 {
 .pads.grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 9px;
+  grid-template-rows: repeat(4, minmax(64px, 1fr));
+  gap: 6px;
+  min-height: 0;
 }
 .pad {
   position: relative;
   min-width: 0;
-  height: 92px;
+  min-height: 0;
   border-radius: 13px;
-  padding: 12px 14px;
+  padding: 10px 12px;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
@@ -483,7 +486,7 @@ h1 {
   position: relative;
   display: flex;
   gap: 6px;
-  height: 230px;
+  min-height: 200px;
   align-items: stretch;
 }
 .pkey-wrap {
@@ -582,7 +585,7 @@ h1 {
   display: flex;
   align-items: center;
   gap: 13px;
-  margin: 14px 2px 12px;
+  margin: 10px 2px 10px;
 }
 input[type="range"] {
   -webkit-appearance: none;
@@ -666,36 +669,36 @@ input[type="range"]::-moz-range-thumb {
   text-align: center;
   font-size: 12.5px;
   color: var(--text-3);
-  margin-top: 12px;
-  min-height: 16px;
+  margin-top: 8px;
+  min-height: 14px;
 }
 
 /* Short portrait screens (smaller iPhones, browsers with thick chrome) —
    tighten chrome so the transport doesn't fall below the fold. */
 @media (orientation: portrait) and (max-height: 760px) {
-  .pad {
-    height: 82px;
-  }
   header {
     margin-bottom: 10px;
   }
   .tab-bar {
-    margin-bottom: 10px;
+    margin-bottom: 8px;
   }
   .tab-bar button {
     height: 40px;
   }
   .bank-row {
-    margin-bottom: 10px;
+    margin-bottom: 8px;
+  }
+  .pads.grid {
+    grid-template-rows: repeat(4, minmax(56px, 1fr));
   }
   .vol {
-    margin: 10px 2px 10px;
+    margin: 8px 2px 8px;
   }
   .transport {
     height: 50px;
   }
   .hint {
-    margin-top: 8px;
+    margin-top: 6px;
   }
 }
 

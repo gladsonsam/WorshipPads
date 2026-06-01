@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:tauri": "npm run build:remote && vite",
     "dev:remote": "vite --config vite.remote.config.ts",
     "build": "tsc && vite build && vite build --config vite.remote.config.ts",
     "build:remote": "vite build --config vite.remote.config.ts",
