@@ -35,19 +35,34 @@ fn restore_audio(app: &tauri::AppHandle) {
     let core = app.state::<CoreState>();
     let engine = app.state::<AudioEngine>();
 
-    let (host, device, pad_channels, click_channels, volume, crossfade_ms, click_bpm, click_beats, click_accent, click_volume) = {
+    let (
+        host,
+        device,
+        pad_channels,
+        click_channels,
+        cue_channels,
+        volume,
+        crossfade_ms,
+        click_bpm,
+        click_beats,
+        click_accent,
+        click_volume,
+        duck_click,
+    ) = {
         let s = core.settings.lock().unwrap();
         (
             s.output_host.clone(),
             s.output_device.clone(),
             (s.channel_left, s.channel_right),
             (s.click.channel_left, s.click.channel_right),
+            (s.cues.channel_left, s.cues.channel_right),
             s.master_volume,
             s.crossfade_ms,
             s.click.bpm,
             s.click.beats_per_bar,
             s.click.accent,
             s.click.volume,
+            s.cues.duck_click,
         )
     };
 
@@ -57,8 +72,9 @@ fn restore_audio(app: &tauri::AppHandle) {
     let _ = engine.set_click_beats(click_beats);
     let _ = engine.set_click_accent(click_accent);
     let _ = engine.set_click_volume(click_volume);
+    let _ = engine.set_duck_click(duck_click);
     if let Some(device) = device {
-        if let Err(e) = engine.set_output(&host, &device, pad_channels, click_channels) {
+        if let Err(e) = engine.set_output(&host, &device, pad_channels, click_channels, cue_channels) {
             eprintln!("[boot] could not restore audio output '{device}' on {host}: {e}");
         }
     }

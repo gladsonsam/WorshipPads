@@ -273,15 +273,21 @@ pub fn set_audio_output(
     // user's existing click pair if it still fits; otherwise default to (2,3)
     // when the device has ≥4 channels, else fold onto (0,1) — which will mix
     // the click into the pad bus.
-    let (click_l, click_r) = {
+    let (click_l, click_r, cue_l, cue_r) = {
         let s = core.settings.lock().unwrap();
-        (s.click.channel_left, s.click.channel_right)
+        (
+            s.click.channel_left,
+            s.click.channel_right,
+            s.cues.channel_left,
+            s.cues.channel_right,
+        )
     };
     engine.set_output(
         &host,
         &device,
         (channel_left, channel_right),
         (click_l, click_r),
+        (cue_l, cue_r),
     )?;
     {
         let mut s = core.settings.lock().unwrap();

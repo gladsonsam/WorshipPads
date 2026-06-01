@@ -28,29 +28,40 @@ const CHUNK: usize = 1024;
 
 /// Handle to a running decoder thread. The audio callback owns the `consumer`;
 /// dropping the owning `Voice` flips `stop`, which makes the decoder thread exit.
+/// `ended` is set true the moment the decoder thread is no longer producing
+/// samples (either reached EOF on a non-looping source or was asked to stop) —
+/// used by the host thread to fire a "cue ended" event without polling audio
+/// callback state.
 pub struct Decoder {
     pub consumer: Consumer<f32>,
     pub stop: Arc<AtomicBool>,
+    pub ended: Arc<AtomicBool>,
 }
 
 /// Spawn a decoder thread for `path`, producing interleaved-stereo f32 at `out_rate`.
-pub fn spawn(path: PathBuf, out_rate: u32) -> Decoder {
+/// When `loop_when_eof` is true (pads), the decoder reopens the source on EOF
+/// for seamless looping. When false (one-shot cues / spoken WAVs), the decoder
+/// exits cleanly at EOF and flips `ended`.
+pub fn spawn(path: PathBuf, out_rate: u32, loop_when_eof: bool) -> Decoder {
     // ~2 seconds of stereo headroom in the ring buffer.
     let capacity = (out_rate as usize * 2 * 2).max(16384);
     let (producer, consumer) = RingBuffer::<f32>::new(capacity);
     let stop = Arc::new(AtomicBool::new(false));
+    let ended = Arc::new(AtomicBool::new(false));
 
     let stop_thread = stop.clone();
+    let ended_thread = ended.clone();
     std::thread::Builder::new()
         .name("pad-decoder".into())
         .spawn(move || {
-            if let Err(e) = decode_loop(&path, out_rate, producer, &stop_thread) {
+            if let Err(e) = decode_loop(&path, out_rate, producer, &stop_thread, loop_when_eof) {
                 eprintln!("[audio] decoder for {path:?} stopped: {e}");
             }
+            ended_thread.store(true, Ordering::Relaxed);
         })
         .expect("failed to spawn decoder thread");
 
-    Decoder { consumer, stop }
+    Decoder { consumer, stop, ended }
 }
 
 struct Source {
@@ -136,6 +147,7 @@ fn decode_loop(
     out_rate: u32,
     mut producer: Producer<f32>,
     stop: &AtomicBool,
+    loop_when_eof: bool,
 ) -> Result<(), String> {
     let mut src = open(path)?;
     let resample = src.in_rate != out_rate;
@@ -158,9 +170,13 @@ fn decode_loop(
         let packet = match src.format.next_packet() {
             Ok(p) => p,
             Err(_) => {
-                // End of file → flush remaining whole chunks, then loop by
-                // reopening from the top (pad files are authored to loop).
+                // End of file → flush remaining whole chunks. Pads reopen the
+                // source for seamless looping; cues / spoken WAVs exit so the
+                // host thread can notice the decoder is done.
                 flush_chunks(&mut pend_l, &mut pend_r, resampler.as_mut(), &mut producer, stop)?;
+                if !loop_when_eof {
+                    return Ok(());
+                }
                 src = open(path)?;
                 continue;
             }
