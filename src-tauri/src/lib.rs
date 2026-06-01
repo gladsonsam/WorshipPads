@@ -5,6 +5,7 @@
 
 pub mod audio;
 mod commands;
+pub mod cues;
 pub mod library;
 pub mod model;
 mod server;
