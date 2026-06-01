@@ -231,6 +231,74 @@ export async function mockInvoke<T>(cmd: string, args: Record<string, unknown> =
       settings.click.channel_left = a.channelLeft;
       settings.click.channel_right = a.channelRight;
       return undefined as T;
+    case "list_voices":
+      return [
+        { id: "Microsoft David Desktop", name: "Microsoft David Desktop" },
+        { id: "Microsoft Zira Desktop", name: "Microsoft Zira Desktop" },
+      ] as T;
+    case "cue_speak":
+    case "cue_speak_quick": {
+      const label =
+        cmd === "cue_speak_quick"
+          ? settings.cues.quick.find((q) => q.id === a.id)?.label ?? null
+          : null;
+      now.cue.speaking = true;
+      now.cue.label = label;
+      emit();
+      // Fake a ~1.2s spoken length so the UI flips back automatically.
+      setTimeout(() => {
+        now.cue.speaking = false;
+        now.cue.label = null;
+        emit();
+      }, 1200);
+      return undefined as T;
+    }
+    case "cue_stop":
+      now.cue.speaking = false;
+      now.cue.label = null;
+      emit();
+      return undefined as T;
+    case "cue_add": {
+      const id = `q-${Date.now().toString(16)}`;
+      const cue = { id, label: a.label, text: a.text };
+      settings.cues.quick.push(cue);
+      return cue as T;
+    }
+    case "cue_update": {
+      const c = settings.cues.quick.find((q) => q.id === a.id);
+      if (c) {
+        c.label = a.label;
+        c.text = a.text;
+      }
+      return undefined as T;
+    }
+    case "cue_remove":
+      settings.cues.quick = settings.cues.quick.filter((q) => q.id !== a.id);
+      return undefined as T;
+    case "cue_move": {
+      const from = settings.cues.quick.findIndex((q) => q.id === a.id);
+      if (from < 0) return undefined as T;
+      const [item] = settings.cues.quick.splice(from, 1);
+      const to = Math.min(a.toIndex, settings.cues.quick.length);
+      settings.cues.quick.splice(to, 0, item);
+      return undefined as T;
+    }
+    case "set_cue_voice":
+      settings.cues.voice = a.voice ?? null;
+      return undefined as T;
+    case "set_cue_rate":
+      settings.cues.rate = a.rate;
+      return undefined as T;
+    case "set_cue_volume":
+      settings.cues.volume = a.volume;
+      return undefined as T;
+    case "set_cue_channels":
+      settings.cues.channel_left = a.channelLeft;
+      settings.cues.channel_right = a.channelRight;
+      return undefined as T;
+    case "set_cue_duck_click":
+      settings.cues.duck_click = !!a.duck;
+      return undefined as T;
     default:
       return undefined as T;
   }

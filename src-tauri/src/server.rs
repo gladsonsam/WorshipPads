@@ -20,7 +20,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tower_http::cors::CorsLayer;
 
 use crate::audio::AudioEngine;
-use crate::commands;
+use crate::commands::{self, CueSynth};
 use crate::state::CoreState;
 
 const REMOTE_HTML: &str = include_str!("../assets/remote.html");
@@ -61,6 +61,9 @@ pub async fn serve(app: AppHandle, port: u16) {
         .route("/api/click/beats", post(click_beats))
         .route("/api/click/accent", post(click_accent))
         .route("/api/click/volume", post(click_volume))
+        .route("/api/cue/speak", post(cue_speak))
+        .route("/api/cue/quick/:id", post(cue_quick))
+        .route("/api/cue/stop", post(cue_stop))
         .route("/ws", get(ws_upgrade))
         .layer(CorsLayer::permissive())
         .with_state(app);
@@ -228,6 +231,42 @@ async fn click_volume(State(app): State<AppHandle>, Json(body): Json<VolumeBody>
         engine.inner(),
         body.volume,
     ))
+}
+
+#[derive(Deserialize)]
+struct SpeakBody { text: String }
+
+async fn cue_speak(State(app): State<AppHandle>, Json(body): Json<SpeakBody>) -> Response {
+    let core = app.state::<CoreState>();
+    let engine = app.state::<AudioEngine>();
+    let synth = app.state::<CueSynth>();
+    map_result(commands::cue_speak_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        synth.0.as_ref(),
+        &body.text,
+        None,
+    ))
+}
+
+async fn cue_quick(State(app): State<AppHandle>, Path(id): Path<String>) -> Response {
+    let core = app.state::<CoreState>();
+    let engine = app.state::<AudioEngine>();
+    let synth = app.state::<CueSynth>();
+    map_result(commands::cue_speak_quick_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        synth.0.as_ref(),
+        &id,
+    ))
+}
+
+async fn cue_stop(State(app): State<AppHandle>) -> Response {
+    let core = app.state::<CoreState>();
+    let engine = app.state::<AudioEngine>();
+    map_result(commands::cue_stop_logic(&app, core.inner(), engine.inner()))
 }
 
 async fn ws_upgrade(State(app): State<AppHandle>, ws: WebSocketUpgrade) -> Response {

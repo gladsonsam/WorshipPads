@@ -148,6 +148,51 @@ export const setClickVolume = (volume: number) =>
 export const setClickChannels = (channelLeft: number, channelRight: number) =>
   invoke<void>("set_click_channels", { channelLeft, channelRight });
 
+/* ── Cues ─────────────────────────────────────────────────────────── */
+
+export interface VoiceInfo {
+  id: string;
+  name: string;
+}
+
+export const listVoices = () => invoke<VoiceInfo[]>("list_voices");
+
+/** Speak free-form text. Renders TTS to a temp WAV then plays it on the cue bus. */
+export const cueSpeak = (text: string) => invoke<void>("cue_speak", { text });
+
+/** Speak a saved quick cue by id. */
+export const cueSpeakQuick = (id: string) =>
+  invoke<void>("cue_speak_quick", { id });
+
+/** Cut any in-flight cue immediately. */
+export const cueStop = () => invoke<void>("cue_stop");
+
+export const cueAdd = (label: string, text: string) =>
+  invoke<QuickCue>("cue_add", { label, text });
+
+export const cueUpdate = (id: string, label: string, text: string) =>
+  invoke<void>("cue_update", { id, label, text });
+
+export const cueRemove = (id: string) => invoke<void>("cue_remove", { id });
+
+export const cueMove = (id: string, toIndex: number) =>
+  invoke<void>("cue_move", { id, toIndex });
+
+export const setCueVoice = (voice: string | null) =>
+  invoke<void>("set_cue_voice", { voice });
+
+export const setCueRate = (rate: number) =>
+  invoke<void>("set_cue_rate", { rate });
+
+export const setCueVolume = (volume: number) =>
+  invoke<void>("set_cue_volume", { volume });
+
+export const setCueChannels = (channelLeft: number, channelRight: number) =>
+  invoke<void>("set_cue_channels", { channelLeft, channelRight });
+
+export const setCueDuckClick = (duck: boolean) =>
+  invoke<void>("set_cue_duck_click", { duck });
+
 /** Subscribe to live now-playing updates pushed from the backend. */
 export const onNowPlaying = (cb: (n: NowPlaying) => void): Promise<UnlistenFn> => {
   if (useMock) {

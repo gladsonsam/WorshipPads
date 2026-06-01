@@ -10,9 +10,15 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::audio::{AudioEngine, DeviceInfo};
+use crate::cues::{self, Synthesizer, VoiceInfo};
 use crate::library;
-use crate::model::{now_unix_ms, Key, NowPlaying, Preset, Settings};
+use crate::model::{now_unix_ms, Key, NowPlaying, Preset, QuickCue, Settings};
 use crate::state::CoreState;
+
+/// Wrapper around the active TTS synthesizer so it can be `manage()`'d as
+/// Tauri state. Trait-object so swapping in a non-SAPI backend is just a
+/// matter of constructing a different `Box<dyn Synthesizer>` at setup.
+pub struct CueSynth(pub Box<dyn Synthesizer>);
 
 // ---------------------------------------------------------------------------
 // Shared logic (used by both Tauri commands and the web server)
@@ -199,6 +205,9 @@ pub struct Info {
     /// Active preset's key → file name (just the file name, no path), so the
     /// phone remote can label each pad like the desktop does.
     pub files: std::collections::HashMap<String, String>,
+    /// Saved quick cues, so the phone can render its button grid from a
+    /// single fetch instead of /api/info + /api/cues.
+    pub cues_quick: Vec<QuickCue>,
     pub now: NowPlaying,
 }
 
@@ -231,12 +240,14 @@ pub fn build_info(core: &CoreState) -> Info {
                 .collect()
         })
         .unwrap_or_default();
+    let cues_quick = s.cues.quick.clone();
     Info {
         keys: Key::ALL.iter().map(|k| k.as_str()).collect(),
         presets,
         active_preset: s.active_preset.clone(),
         mapped_keys,
         files,
+        cues_quick,
         now,
     }
 }
@@ -605,5 +616,294 @@ pub fn set_click_channels(
     channel_right: usize,
 ) -> Result<(), String> {
     set_click_channels_logic(core.inner(), engine.inner(), channel_left, channel_right)
+}
+
+// ---------------------------------------------------------------------------
+// Cues (TTS)
+// ---------------------------------------------------------------------------
+
+/// Render the given text to a temp WAV and ask the audio engine to play it on
+/// the cue bus. Sets `now.cue.speaking = true` synchronously so the UI flips
+/// the moment the user taps; the matching `false` flip arrives via the
+/// engine's `CueEnded` event (see lib.rs setup).
+pub fn cue_speak_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    synth: &dyn Synthesizer,
+    text: &str,
+    label: Option<String>,
+) -> Result<(), String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("nothing to speak".into());
+    }
+    let (voice, rate) = {
+        let s = core.settings.lock().unwrap();
+        (s.cues.voice.clone(), s.cues.rate)
+    };
+    let out = cues::sapi_temp_wav_path();
+    synth.synth_to_wav(trimmed, voice.as_deref(), rate, &out)?;
+    engine.play_cue(out)?;
+    {
+        let mut n = core.now.lock().unwrap();
+        n.cue.speaking = true;
+        n.cue.label = label;
+    }
+    emit_now(app, core);
+    Ok(())
+}
+
+pub fn cue_stop_logic(app: &AppHandle, core: &CoreState, engine: &AudioEngine) -> Result<(), String> {
+    engine.stop_cue()?;
+    {
+        let mut n = core.now.lock().unwrap();
+        n.cue.speaking = false;
+        n.cue.label = None;
+    }
+    emit_now(app, core);
+    Ok(())
+}
+
+pub fn cue_speak_quick_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    synth: &dyn Synthesizer,
+    id: &str,
+) -> Result<(), String> {
+    let cue = {
+        let s = core.settings.lock().unwrap();
+        s.cues
+            .quick
+            .iter()
+            .find(|c| c.id == id)
+            .cloned()
+            .ok_or_else(|| format!("no quick cue '{id}'"))?
+    };
+    cue_speak_logic(app, core, engine, synth, &cue.text, Some(cue.label))
+}
+
+/// Mint a short opaque id from the current time so quick cues survive
+/// rename/edit without breaking phone references.
+fn new_cue_id() -> String {
+    let n = now_unix_ms();
+    format!("q-{n:x}")
+}
+
+pub fn cue_add_logic(core: &CoreState, label: String, text: String) -> Result<QuickCue, String> {
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return Err("label cannot be empty".into());
+    }
+    let cue = QuickCue {
+        id: new_cue_id(),
+        label,
+        text,
+    };
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.cues.quick.push(cue.clone());
+    }
+    core.save()?;
+    Ok(cue)
+}
+
+pub fn cue_update_logic(
+    core: &CoreState,
+    id: &str,
+    label: String,
+    text: String,
+) -> Result<(), String> {
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return Err("label cannot be empty".into());
+    }
+    {
+        let mut s = core.settings.lock().unwrap();
+        let c = s
+            .cues
+            .quick
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or_else(|| format!("no quick cue '{id}'"))?;
+        c.label = label;
+        c.text = text;
+    }
+    core.save()
+}
+
+pub fn cue_remove_logic(core: &CoreState, id: &str) -> Result<(), String> {
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.cues.quick.retain(|c| c.id != id);
+    }
+    core.save()
+}
+
+/// Move the cue with `id` to `to_index`. Indexes past the end clamp to the
+/// end; negative not handled (caller uses usize).
+pub fn cue_move_logic(core: &CoreState, id: &str, to_index: usize) -> Result<(), String> {
+    {
+        let mut s = core.settings.lock().unwrap();
+        let Some(from) = s.cues.quick.iter().position(|c| c.id == id) else {
+            return Err(format!("no quick cue '{id}'"));
+        };
+        let item = s.cues.quick.remove(from);
+        let to = to_index.min(s.cues.quick.len());
+        s.cues.quick.insert(to, item);
+    }
+    core.save()
+}
+
+pub fn set_cue_voice_logic(core: &CoreState, voice: Option<String>) -> Result<(), String> {
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.cues.voice = voice.filter(|v| !v.trim().is_empty());
+    }
+    core.save()
+}
+
+pub fn set_cue_rate_logic(core: &CoreState, rate: i32) -> Result<(), String> {
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.cues.rate = rate.clamp(-10, 10);
+    }
+    core.save()
+}
+
+pub fn set_cue_volume_logic(core: &CoreState, volume: f32) -> Result<(), String> {
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.cues.volume = volume.clamp(0.0, 1.0);
+    }
+    core.save()
+}
+
+pub fn set_cue_channels_logic(
+    core: &CoreState,
+    engine: &AudioEngine,
+    channel_left: usize,
+    channel_right: usize,
+) -> Result<(), String> {
+    engine.set_cue_channels((channel_left, channel_right))?;
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.cues.channel_left = channel_left;
+        s.cues.channel_right = channel_right;
+    }
+    core.save()
+}
+
+pub fn set_cue_duck_click_logic(
+    core: &CoreState,
+    engine: &AudioEngine,
+    duck: bool,
+) -> Result<(), String> {
+    engine.set_duck_click(duck)?;
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.cues.duck_click = duck;
+    }
+    core.save()
+}
+
+#[tauri::command]
+pub fn list_voices(synth: State<'_, CueSynth>) -> Result<Vec<VoiceInfo>, String> {
+    synth.0.voices()
+}
+
+#[tauri::command]
+pub fn cue_speak(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    synth: State<'_, CueSynth>,
+    text: String,
+) -> Result<(), String> {
+    cue_speak_logic(&app, core.inner(), engine.inner(), synth.0.as_ref(), &text, None)
+}
+
+#[tauri::command]
+pub fn cue_speak_quick(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    synth: State<'_, CueSynth>,
+    id: String,
+) -> Result<(), String> {
+    cue_speak_quick_logic(&app, core.inner(), engine.inner(), synth.0.as_ref(), &id)
+}
+
+#[tauri::command]
+pub fn cue_stop(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+) -> Result<(), String> {
+    cue_stop_logic(&app, core.inner(), engine.inner())
+}
+
+#[tauri::command]
+pub fn cue_add(
+    core: State<'_, CoreState>,
+    label: String,
+    text: String,
+) -> Result<QuickCue, String> {
+    cue_add_logic(core.inner(), label, text)
+}
+
+#[tauri::command]
+pub fn cue_update(
+    core: State<'_, CoreState>,
+    id: String,
+    label: String,
+    text: String,
+) -> Result<(), String> {
+    cue_update_logic(core.inner(), &id, label, text)
+}
+
+#[tauri::command]
+pub fn cue_remove(core: State<'_, CoreState>, id: String) -> Result<(), String> {
+    cue_remove_logic(core.inner(), &id)
+}
+
+#[tauri::command]
+pub fn cue_move(core: State<'_, CoreState>, id: String, to_index: usize) -> Result<(), String> {
+    cue_move_logic(core.inner(), &id, to_index)
+}
+
+#[tauri::command]
+pub fn set_cue_voice(core: State<'_, CoreState>, voice: Option<String>) -> Result<(), String> {
+    set_cue_voice_logic(core.inner(), voice)
+}
+
+#[tauri::command]
+pub fn set_cue_rate(core: State<'_, CoreState>, rate: i32) -> Result<(), String> {
+    set_cue_rate_logic(core.inner(), rate)
+}
+
+#[tauri::command]
+pub fn set_cue_volume(core: State<'_, CoreState>, volume: f32) -> Result<(), String> {
+    set_cue_volume_logic(core.inner(), volume)
+}
+
+#[tauri::command]
+pub fn set_cue_channels(
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    channel_left: usize,
+    channel_right: usize,
+) -> Result<(), String> {
+    set_cue_channels_logic(core.inner(), engine.inner(), channel_left, channel_right)
+}
+
+#[tauri::command]
+pub fn set_cue_duck_click(
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    duck: bool,
+) -> Result<(), String> {
+    set_cue_duck_click_logic(core.inner(), engine.inner(), duck)
 }
 

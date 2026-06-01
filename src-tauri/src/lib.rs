@@ -12,6 +12,7 @@ mod server;
 mod state;
 
 use audio::AudioEngine;
+use cues::SapiSynth;
 use state::CoreState;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -97,6 +98,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(AudioEngine::new())
+        .manage(commands::CueSynth(Box::new(SapiSynth::new())))
         .setup(|app| {
             // Load persisted settings into managed CoreState.
             let config_path = app
@@ -108,6 +110,34 @@ pub fn run() {
 
             // Re-bind the saved audio device/channels/volume.
             restore_audio(app.handle());
+
+            // Bridge the audio engine's upstream events (cue started / ended)
+            // to NowPlaying broadcasts so every connected client sees the
+            // `cue.speaking` flag flip when a cue finishes.
+            let events = app.state::<AudioEngine>().events();
+            let app_for_events = app.handle().clone();
+            std::thread::Builder::new()
+                .name("engine-events".into())
+                .spawn(move || {
+                    while let Ok(ev) = events.recv() {
+                        match ev {
+                            audio::EngineEvent::CueStarted => {
+                                // commands.rs flips speaking=true synchronously
+                                // before calling play_cue, so no work here.
+                            }
+                            audio::EngineEvent::CueEnded => {
+                                let core = app_for_events.state::<CoreState>();
+                                {
+                                    let mut n = core.now.lock().unwrap();
+                                    n.cue.speaking = false;
+                                    n.cue.label = None;
+                                }
+                                commands::emit_now(&app_for_events, core.inner());
+                            }
+                        }
+                    }
+                })
+                .ok();
 
             // Start the phone-remote web server on the configured port.
             let port = app
@@ -204,6 +234,19 @@ pub fn run() {
             commands::set_click_accent,
             commands::set_click_volume,
             commands::set_click_channels,
+            commands::list_voices,
+            commands::cue_speak,
+            commands::cue_speak_quick,
+            commands::cue_stop,
+            commands::cue_add,
+            commands::cue_update,
+            commands::cue_remove,
+            commands::cue_move,
+            commands::set_cue_voice,
+            commands::set_cue_rate,
+            commands::set_cue_volume,
+            commands::set_cue_channels,
+            commands::set_cue_duck_click,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

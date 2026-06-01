@@ -9,5 +9,5 @@
 mod sapi;
 mod synth;
 
-pub use sapi::SapiSynth;
+pub use sapi::{temp_wav_path as sapi_temp_wav_path, SapiSynth};
 pub use synth::{Synthesizer, VoiceInfo};
