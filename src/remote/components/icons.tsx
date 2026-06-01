@@ -155,3 +155,36 @@ export function PlusIcon() {
     </svg>
   );
 }
+
+export function CuesTabIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 20 20" aria-hidden>
+      <g
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <rect x="8" y="3" width="4" height="9" rx="2" />
+        <path d="M5 10a5 5 0 0 0 10 0" />
+        <path d="M10 15v2" />
+      </g>
+    </svg>
+  );
+}
+
+export function ChevUpIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 20 20" aria-hidden>
+      <path
+        d="M5 12.5l5-5 5 5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}

@@ -1,13 +1,61 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ComponentType, type ReactElement } from "react";
 import { useRemoteState } from "./hooks/useRemoteState";
-import { ClickTabIcon, MarkLogoIcon, PadsTabIcon } from "./components/icons";
+import {
+  ClickTabIcon,
+  CuesTabIcon,
+  MarkLogoIcon,
+  PadsTabIcon,
+} from "./components/icons";
 import { PadsTab, type PadStyle } from "./components/PadsTab";
 import { ClickTab } from "./components/ClickTab";
+import { CuesTab } from "./components/CuesTab";
+import type { NowPlaying } from "../shared/types";
+import type { Info } from "./api";
 
-type Tab = "pads" | "click";
+type Tab = "pads" | "click" | "cues";
 
 const STYLE_KEY = "worshippads.remote.padStyle";
 const TAB_KEY = "worshippads.remote.tab";
+
+/** Shape passed to each tab's renderer. Tabs only render the props they use. */
+interface TabContext {
+  info: Info | null;
+  now: NowPlaying;
+  padStyle: PadStyle;
+  onPadStyle: (s: PadStyle) => void;
+}
+
+interface TabDef {
+  key: Tab;
+  label: string;
+  Icon: ComponentType;
+  render: (ctx: TabContext) => ReactElement;
+}
+
+// One source of truth for tabs — adding a fourth means one more entry, not
+// edits scattered across the tab bar and switch statements.
+const TABS: TabDef[] = [
+  {
+    key: "pads",
+    label: "Pads",
+    Icon: PadsTabIcon,
+    render: ({ info, now, padStyle, onPadStyle }) => (
+      <PadsTab info={info} now={now} padStyle={padStyle} onPadStyle={onPadStyle} />
+    ),
+  },
+  {
+    key: "click",
+    label: "Click",
+    Icon: ClickTabIcon,
+    render: ({ now }) => <ClickTab now={now} />,
+  },
+  {
+    key: "cues",
+    label: "Cues",
+    Icon: CuesTabIcon,
+    render: ({ info, now }) => <CuesTab info={info} now={now} />,
+  },
+];
 
 function loadPadStyle(): PadStyle {
   const v = localStorage.getItem(STYLE_KEY);
@@ -15,7 +63,7 @@ function loadPadStyle(): PadStyle {
 }
 function loadTab(): Tab {
   const v = localStorage.getItem(TAB_KEY);
-  return v === "click" ? "click" : "pads";
+  return TABS.some((t) => t.key === v) ? (v as Tab) : "pads";
 }
 
 export default function App() {
@@ -29,6 +77,9 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(STYLE_KEY, padStyle);
   }, [padStyle]);
+
+  const active = TABS.find((t) => t.key === tab) ?? TABS[0];
+  const ctx: TabContext = { info, now, padStyle, onPadStyle: setPadStyle };
 
   return (
     <>
@@ -44,31 +95,21 @@ export default function App() {
       </header>
 
       <div className="tab-bar" role="tablist">
-        <button
-          type="button"
-          role="tab"
-          className={tab === "pads" ? "on" : ""}
-          onClick={() => setTab("pads")}
-        >
-          <PadsTabIcon />
-          <span className="tab-label">Pads</span>
-        </button>
-        <button
-          type="button"
-          role="tab"
-          className={tab === "click" ? "on" : ""}
-          onClick={() => setTab("click")}
-        >
-          <ClickTabIcon />
-          <span className="tab-label">Click</span>
-        </button>
+        {TABS.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            role="tab"
+            className={tab === t.key ? "on" : ""}
+            onClick={() => setTab(t.key)}
+          >
+            <t.Icon />
+            <span className="tab-label">{t.label}</span>
+          </button>
+        ))}
       </div>
 
-      {tab === "pads" ? (
-        <PadsTab info={info} now={now} padStyle={padStyle} onPadStyle={setPadStyle} />
-      ) : (
-        <ClickTab now={now} />
-      )}
+      {active.render(ctx)}
     </>
   );
 }

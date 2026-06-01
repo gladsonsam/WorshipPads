@@ -9,6 +9,12 @@ export interface PresetBrief {
   name: string;
 }
 
+export interface QuickCue {
+  id: string;
+  label: string;
+  text: string;
+}
+
 export interface Info {
   keys: string[];
   presets: PresetBrief[];
@@ -16,6 +22,7 @@ export interface Info {
   mapped_keys: string[];
   /** Active preset's key → file name (basename only, for pad labels). */
   files: Record<string, string>;
+  cues_quick: QuickCue[];
   now: NowPlaying;
 }
 
