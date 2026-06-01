@@ -3,6 +3,7 @@
 
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { Key, NowPlaying } from "../shared/types";
 
 // In a dev build running outside Tauri (a plain browser), fall back to an
 // in-memory mock so the UI is fully explorable. Production builds always run
@@ -18,13 +19,8 @@ function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   return tauriInvoke<T>(cmd, args);
 }
 
-export type Key =
-  | "C" | "C#" | "D" | "D#" | "E" | "F"
-  | "F#" | "G" | "G#" | "A" | "A#" | "B";
-
-export const ALL_KEYS: Key[] = [
-  "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-];
+export { ALL_KEYS } from "../shared/types";
+export type { Key, ClickNow, NowPlaying } from "../shared/types";
 
 export interface DeviceInfo {
   /** cpal host label, e.g. "WASAPI" or "ASIO". */
@@ -65,25 +61,6 @@ export interface Settings {
   active_preset: string | null;
   server_port: number;
   click: ClickSettings;
-}
-
-export interface ClickNow {
-  enabled: boolean;
-  bpm: number;
-  beats_per_bar: number;
-  /** Mirrors ClickSettings — broadcast so the phone remote sees desktop edits. */
-  volume: number;
-  accent: boolean;
-  /** unix-epoch ms when the click was last (re)started; null when stopped. */
-  started_at_ms: number | null;
-}
-
-export interface NowPlaying {
-  key: Key | null;
-  preset: string | null;
-  volume: number;
-  playing: boolean;
-  click: ClickNow;
 }
 
 export interface ServerUrl {
