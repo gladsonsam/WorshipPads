@@ -114,6 +114,22 @@ pub fn run() {
             // Re-bind the saved audio device/channels/volume.
             restore_audio(app.handle());
 
+            // Pre-warm SAPI. The first PowerShell + System.Speech invocation
+            // costs ~2–4 s on a cold system, which made the first auto-cue
+            // ("Key of G") feel silent until the user touched something else.
+            // A throwaway voice listing on a background thread loads the OS
+            // caches so the first real cue lands instantly.
+            let app_for_warm = app.handle().clone();
+            std::thread::Builder::new()
+                .name("sapi-prewarm".into())
+                .spawn(move || {
+                    let synth = app_for_warm.state::<commands::CueSynth>();
+                    if let Err(e) = synth.0.voices() {
+                        eprintln!("[boot] sapi prewarm: {e}");
+                    }
+                })
+                .ok();
+
             // Bridge the audio engine's upstream events (cue started / ended)
             // to NowPlaying broadcasts so every connected client sees the
             // `cue.speaking` flag flip when a cue finishes.

@@ -95,7 +95,9 @@ pub fn play_key_logic(
     // the user's saved rate for their own cues.
     if speak_key {
         let text = format!("Key of {}", k.spoken());
-        let _ = cue_speak_logic(app, core, engine, synth, &text, None, Some(-4));
+        if let Err(e) = cue_speak_logic(app, core, engine, synth, &text, None, Some(-4)) {
+            eprintln!("[cue] auto key-announcement failed: {e}");
+        }
     }
     Ok(())
 }
