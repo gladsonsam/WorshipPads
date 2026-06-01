@@ -66,6 +66,7 @@ pub async fn serve(app: AppHandle, port: u16) {
         .route("/api/cue/speak", post(cue_speak))
         .route("/api/cue/quick/:id", post(cue_quick))
         .route("/api/cue/stop", post(cue_stop))
+        .route("/api/sync", post(sync))
         .route("/ws", get(ws_upgrade))
         .layer(CorsLayer::permissive())
         .with_state(app);
@@ -314,6 +315,106 @@ async fn cue_stop(State(app): State<AppHandle>) -> Response {
         let core = app.state::<CoreState>();
         let engine = app.state::<AudioEngine>();
         commands::cue_stop_logic(&app, core.inner(), engine.inner())
+    })
+    .await;
+    map_result(r)
+}
+
+/// Universal sync endpoint for external controllers (e.g. FreeShow actions).
+/// All fields are optional — send any subset and only those are applied.
+/// Numeric fields accept both JSON numbers and quoted strings ("120" or 120)
+/// because some emitters (e.g. FreeShow message templates) always produce strings.
+///
+/// ```json
+/// { "key": "G", "bpm": 120, "beats": 4 }
+/// ```
+#[derive(Deserialize)]
+struct SyncBody {
+    key: Option<String>,
+    #[serde(default, deserialize_with = "de_f32_or_str")]
+    bpm: Option<f32>,
+    #[serde(default, deserialize_with = "de_u32_or_str")]
+    beats: Option<u32>,
+}
+
+fn de_f32_or_str<'de, D>(d: D) -> Result<Option<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let v: Option<serde_json::Value> = Option::deserialize(d)?;
+    match v {
+        None => Ok(None),
+        Some(serde_json::Value::Number(n)) => n
+            .as_f64()
+            .map(|f| Some(f as f32))
+            .ok_or_else(|| D::Error::custom("bpm out of range")),
+        Some(serde_json::Value::String(s)) => s
+            .trim()
+            .parse::<f32>()
+            .map(Some)
+            .map_err(|_| D::Error::custom(format!("bpm not a number: {s}"))),
+        Some(other) => Err(D::Error::custom(format!("bpm unexpected: {other}"))),
+    }
+}
+
+fn de_u32_or_str<'de, D>(d: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let v: Option<serde_json::Value> = Option::deserialize(d)?;
+    match v {
+        None => Ok(None),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .map(|u| Some(u as u32))
+            .ok_or_else(|| D::Error::custom("beats out of range")),
+        Some(serde_json::Value::String(s)) => s
+            .trim()
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| D::Error::custom(format!("beats not a number: {s}"))),
+        Some(other) => Err(D::Error::custom(format!("beats unexpected: {other}"))),
+    }
+}
+
+async fn sync(State(app): State<AppHandle>, raw: axum::body::Bytes) -> Response {
+    eprintln!("[sync] received: {}", String::from_utf8_lossy(&raw));
+
+    let body: SyncBody = match serde_json::from_slice(&raw) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[sync] parse error: {e}");
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+    };
+
+    let r = run_blocking(move || {
+        let core = app.state::<CoreState>();
+        let engine = app.state::<AudioEngine>();
+        let synth = app.state::<CueSynth>();
+
+        let click_changed = body.bpm.is_some() || body.beats.is_some();
+        if let Some(bpm) = body.bpm {
+            commands::set_click_bpm_logic(&app, core.inner(), engine.inner(), bpm)?;
+        }
+        if let Some(beats) = body.beats {
+            commands::set_click_beats_logic(&app, core.inner(), engine.inner(), beats)?;
+        }
+        if click_changed {
+            commands::set_click_enabled_logic(&app, core.inner(), engine.inner(), true)?;
+        }
+        if let Some(key) = body.key.filter(|k| !k.trim().is_empty()) {
+            commands::play_key_logic(
+                &app,
+                core.inner(),
+                engine.inner(),
+                synth.0.as_ref(),
+                &key,
+            )?;
+        }
+        Ok(())
     })
     .await;
     map_result(r)
