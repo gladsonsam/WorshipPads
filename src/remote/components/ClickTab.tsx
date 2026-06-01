@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { NowPlaying } from "../../shared/types";
+import { useHoldRepeat } from "../../shared/useHoldRepeat";
 import { post } from "../api";
 import { MinusIcon, PlusIcon, VolumeIcon } from "./icons";
 
@@ -67,25 +68,84 @@ export function ClickTab({ now }: Props) {
 }
 
 function BpmBlock({ bpm }: { bpm: number }) {
+  const bpmRef = useRef(bpm);
+  bpmRef.current = bpm;
+  const startRef = useRef(0);
+  const sendBpm = (v: number) => post("/api/click/bpm", { bpm: clampBpm(v) });
+
+  const minusProps = useHoldRepeat((n) => {
+    if (n === 1) startRef.current = bpmRef.current;
+    sendBpm(startRef.current - n);
+  });
+  const plusProps = useHoldRepeat((n) => {
+    if (n === 1) startRef.current = bpmRef.current;
+    sendBpm(startRef.current + n);
+  });
+
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (editing && inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.select();
+    }
+  }, [editing]);
+
+  const startEdit = () => {
+    setDraft(String(bpm));
+    setEditing(true);
+  };
+  const commit = () => {
+    const n = Number(draft);
+    if (Number.isFinite(n) && draft.trim() !== "") sendBpm(n);
+    setEditing(false);
+  };
+
   return (
     <div className="bpm-block">
       <button
         type="button"
         className="bpm-step"
-        aria-label="Decrease BPM by 5"
-        onClick={() => post("/api/click/bpm", { bpm: clampBpm(bpm - 5) })}
+        aria-label="Decrease BPM"
+        {...minusProps}
       >
         <MinusIcon />
       </button>
-      <div className="bpm-pill">
+      <div
+        className="bpm-pill"
+        onClick={editing ? undefined : startEdit}
+        role="button"
+        tabIndex={editing ? -1 : 0}
+      >
         <span className="glyph">♩=</span>
-        <span className="val">{bpm}</span>
+        {editing ? (
+          <input
+            ref={inputRef}
+            className="bpm-input"
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]*"
+            value={draft}
+            onChange={(e) =>
+              setDraft(e.target.value.replace(/[^0-9]/g, "").slice(0, 4))
+            }
+            onBlur={commit}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commit();
+              else if (e.key === "Escape") setEditing(false);
+            }}
+          />
+        ) : (
+          <span className="val">{bpm}</span>
+        )}
       </div>
       <button
         type="button"
         className="bpm-step"
-        aria-label="Increase BPM by 5"
-        onClick={() => post("/api/click/bpm", { bpm: clampBpm(bpm + 5) })}
+        aria-label="Increase BPM"
+        {...plusProps}
       >
         <PlusIcon />
       </button>
