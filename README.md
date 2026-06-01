@@ -5,7 +5,7 @@
 <h1 align="center">Worship Pads</h1>
 
 A Tauri desktop app that plays looping worship pads locally and
-routes them to specific channels of any audio interface (via ASIO on Windows),
+routes them to specific channels of any audio interface (via ASIO),
 while your phone acts as a wireless remote.
 
 <p align="center">
