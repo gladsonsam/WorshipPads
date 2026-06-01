@@ -343,22 +343,31 @@ pub fn scan_library(
     folder: String,
     name: Option<String>,
 ) -> Result<Preset, String> {
-    let scanned = library::scan_preset(std::path::Path::new(&folder), name.clone())?;
+    // Preset id is just the folder path, so we can look up the existing entry
+    // without scanning the folder first. The actual filesystem scan runs
+    // OUTSIDE the Settings lock so other commands aren't blocked on it.
+    let folder_path = std::path::PathBuf::from(&folder);
+    let id = folder_path.to_string_lossy().to_string();
 
-    let preset = {
-        let mut s = core.settings.lock().unwrap();
-        // Re-scanning a folder already added preserves the user's manual mappings.
-        let merged = match s.presets.iter().find(|p| p.id == scanned.id) {
-            Some(existing) => library::rescan_preserving(existing, name)?,
-            None => scanned,
-        };
-        s.presets.retain(|p| p.id != merged.id);
-        s.presets.push(merged.clone());
-        if s.active_preset.is_none() {
-            s.active_preset = Some(merged.id.clone());
-        }
-        merged
+    let existing = {
+        let s = core.settings.lock().unwrap();
+        s.presets.iter().find(|p| p.id == id).cloned()
     };
+
+    // Re-scanning a folder already added preserves the user's manual mappings.
+    let preset = match existing {
+        Some(e) => library::rescan_preserving(&e, name)?,
+        None => library::scan_preset(&folder_path, name)?,
+    };
+
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.presets.retain(|p| p.id != preset.id);
+        s.presets.push(preset.clone());
+        if s.active_preset.is_none() {
+            s.active_preset = Some(preset.id.clone());
+        }
+    }
     core.save()?;
     Ok(preset)
 }
