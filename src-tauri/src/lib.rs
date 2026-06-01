@@ -111,8 +111,15 @@ pub fn run() {
                 .unwrap_or_else(|_| std::path::PathBuf::from("settings.json"));
             app.manage(CoreState::load(config_path));
 
-            // Re-bind the saved audio device/channels/volume.
-            restore_audio(app.handle());
+            // Re-bind the saved audio device/channels/volume on a background
+            // thread so a slow or hung audio driver can't block setup() from
+            // returning — the main window needs to show even when audio is
+            // misbehaving.
+            let app_for_restore = app.handle().clone();
+            std::thread::Builder::new()
+                .name("restore-audio".into())
+                .spawn(move || restore_audio(&app_for_restore))
+                .ok();
 
             // Pre-warm SAPI. The first PowerShell + System.Speech invocation
             // costs ~2–4 s on a cold system, which made the first auto-cue
