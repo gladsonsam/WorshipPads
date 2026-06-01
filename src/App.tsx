@@ -22,6 +22,8 @@ import {
   setClickEnabled,
   setClickVolume,
   setCrossfade,
+  setCueChannels,
+  setCueDuckClick,
   setPreset,
   setVolume,
   stopPads,
@@ -32,6 +34,7 @@ import {
   type ServerUrl,
   type Settings,
 } from "./lib/ipc";
+import { CuesPage } from "./components/CuesPage";
 import {
   BeatDots,
   BpmDisplay,
@@ -61,8 +64,8 @@ function baseName(path: string): string {
 const PAD_STYLE_KEY = "worshippads.padStyle";
 const PAGE_KEY = "worshippads.page";
 
-type Page = "pads" | "click" | "library" | "settings";
-const PAGES: Page[] = ["pads", "click", "library", "settings"];
+type Page = "pads" | "click" | "cues" | "library" | "settings";
+const PAGES: Page[] = ["pads", "click", "cues", "library", "settings"];
 
 function App() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -203,6 +206,7 @@ function App() {
         <nav className="sidebar" aria-label="Main navigation">
           <NavItem icon="grid" label="Pads" active={page === "pads"} onClick={() => navigate("pads")} />
           <NavItem icon="metronome" label="Click" active={page === "click"} onClick={() => navigate("click")} />
+          <NavItem icon="mic" label="Cues" active={page === "cues"} onClick={() => navigate("cues")} />
           <NavItem icon="folder" label="Library" active={page === "library"} onClick={() => navigate("library")} />
           <NavItem icon="sliders" label="Settings" active={page === "settings"} onClick={() => navigate("settings")} />
         </nav>
@@ -227,6 +231,15 @@ function App() {
               settings={settings}
               click={now?.click ?? null}
               guard={guard}
+            />
+          )}
+          {page === "cues" && (
+            <CuesPage
+              settings={settings}
+              speaking={!!now?.cue?.speaking}
+              speakingLabel={now?.cue?.label ?? null}
+              guard={guard}
+              refreshSettings={refreshSettings}
             />
           )}
           {page === "library" && (
@@ -676,6 +689,44 @@ function SettingsPage({
         <p className="helper-note">
           The click is mono. Use stereo only if your IEM bus expects a stereo pair —
           most click busses are mono.
+        </p>
+      </Card>
+
+      <Card pad={22}>
+        <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 14 }}>
+          <Icon name="mic" size={17} stroke="var(--accent-ink)" />
+          <Eyebrow style={{ letterSpacing: "0.1em" }}>Cue output</Eyebrow>
+        </div>
+
+        <RoutingPicker
+          channelCount={channelCount}
+          channelLeft={settings.cues.channel_left}
+          channelRight={settings.cues.channel_right}
+          onChange={(l, r) =>
+            guard(async () => {
+              await setCueChannels(l, r);
+              await refreshSettings();
+            })
+          }
+        />
+
+        <label className="click-toggle" style={{ marginTop: 16 }}>
+          <input
+            type="checkbox"
+            checked={settings.cues.duck_click}
+            onChange={(e) =>
+              guard(async () => {
+                await setCueDuckClick(e.target.checked);
+                await refreshSettings();
+              })
+            }
+          />
+          Duck click while speaking
+        </label>
+
+        <p className="helper-note">
+          Pick a spare output pair for spoken cues — they're meant for the band's IEMs,
+          not the main mix. To share the click bus, point this at the same channels.
         </p>
       </Card>
     </div>

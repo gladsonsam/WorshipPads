@@ -1069,6 +1069,91 @@ button {
   white-space: pre-wrap;
 }
 
+/* ─────────────────────────── cues page ────────────────────────────── */
+.cue-row {
+  display: grid;
+  grid-template-columns: 160px 1fr auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  transition: border-color 0.18s ease, background 0.18s ease;
+}
+.cue-row.active {
+  background: color-mix(in oklch, var(--accent) 12%, var(--surface));
+  border-color: color-mix(in oklch, var(--accent) 38%, transparent);
+}
+.cue-row input {
+  height: 36px;
+  padding: 0 12px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 13.5px;
+  min-width: 0;
+}
+.cue-row input:focus-visible {
+  outline-offset: 0;
+  border-color: color-mix(in oklch, var(--accent) 55%, var(--line-2));
+}
+.cue-row .cue-label {
+  font-weight: 600;
+}
+.cue-row .cue-text {
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+.cue-textarea {
+  width: 100%;
+  min-height: 84px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.45;
+  resize: vertical;
+}
+.cue-textarea:focus-visible {
+  outline-offset: 0;
+  border-color: color-mix(in oklch, var(--accent) 55%, var(--line-2));
+}
+
+.cue-speaking {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+  padding: 6px 12px 6px 14px;
+  border-radius: 999px;
+  background: color-mix(in oklch, var(--accent) 14%, var(--surface));
+  border: 1px solid color-mix(in oklch, var(--accent) 38%, transparent);
+}
+.cue-speaking-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--accent);
+  animation: meterPulse 1.2s ease-in-out infinite;
+}
+.cue-speaking-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent-ink);
+}
+.cue-speaking .btn {
+  height: 30px;
+  padding: 0 12px;
+  font-size: 12.5px;
+}
+
 /* ─────────────────────────── connect modal ────────────────────────── */
 .scrim {
   position: fixed;

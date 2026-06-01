@@ -27,7 +27,8 @@ export type IconName =
   | "metronome"
   | "play"
   | "stop"
-  | "minus";
+  | "minus"
+  | "mic";
 
 export function Icon({
   name,
@@ -140,6 +141,13 @@ export function Icon({
     play: <path d="M6 4l10 6-10 6V4z" {...p} />,
     stop: <rect x="5" y="5" width="10" height="10" rx="1.6" {...p} />,
     minus: <path d="M4 10h12" {...p} />,
+    mic: (
+      <g {...p}>
+        <rect x="8" y="3" width="4" height="9" rx="2" />
+        <path d="M5 10a5 5 0 0 0 10 0" />
+        <path d="M10 15v2" />
+      </g>
+    ),
   };
   return (
     <svg
