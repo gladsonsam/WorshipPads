@@ -31,6 +31,7 @@ const settings: Settings = {
     channel_left: 4,
     channel_right: 5,
     duck_click: false,
+    speak_key_on_change: false,
     quick: [
       { id: "q-verse-2", label: "Verse 2", text: "Verse two." },
       { id: "q-bridge", label: "Bridge", text: "Bridge coming up." },
@@ -139,11 +140,24 @@ export async function mockInvoke<T>(cmd: string, args: Record<string, unknown> =
       if (now.playing && now.key === a.key) {
         now.playing = false;
         now.key = null;
+        emit();
       } else {
         now.key = a.key;
         now.playing = true;
+        emit();
+        if (settings.cues.speak_key_on_change) {
+          const spoken = String(a.key).replace("#", " sharp");
+          const label = `Key of ${spoken}`;
+          now.cue.speaking = true;
+          now.cue.label = label;
+          emit();
+          setTimeout(() => {
+            now.cue.speaking = false;
+            now.cue.label = null;
+            emit();
+          }, 1200);
+        }
       }
-      emit();
       return undefined as T;
     }
     case "stop":
@@ -298,6 +312,9 @@ export async function mockInvoke<T>(cmd: string, args: Record<string, unknown> =
       return undefined as T;
     case "set_cue_duck_click":
       settings.cues.duck_click = !!a.duck;
+      return undefined as T;
+    case "set_cue_speak_key":
+      settings.cues.speak_key_on_change = !!a.enabled;
       return undefined as T;
     default:
       return undefined as T;

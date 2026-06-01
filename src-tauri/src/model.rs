@@ -79,6 +79,24 @@ impl Key {
         }
     }
 
+    /// TTS-friendly spelling — SAPI says "#" as "hash", so spell sharps out.
+    pub fn spoken(self) -> &'static str {
+        match self {
+            Key::C => "C",
+            Key::Cs => "C sharp",
+            Key::D => "D",
+            Key::Ds => "D sharp",
+            Key::E => "E",
+            Key::F => "F",
+            Key::Fs => "F sharp",
+            Key::G => "G",
+            Key::Gs => "G sharp",
+            Key::A => "A",
+            Key::As => "A sharp",
+            Key::B => "B",
+        }
+    }
+
     /// Parse a key from an API/UI string (accepts sharps and flats).
     pub fn parse(s: &str) -> Option<Key> {
         let norm = s.trim().to_lowercase();
@@ -195,6 +213,11 @@ pub struct CueSettings {
     /// Drop the click bus ~12 dB while a cue is speaking. Off by default.
     #[serde(default)]
     pub duck_click: bool,
+    /// Auto-announce the new key whenever a pad changes (e.g. "Key of G").
+    /// Triggered from `play_key_logic` so desktop and phone-remote presses
+    /// both fire it. Off by default.
+    #[serde(default)]
+    pub speak_key_on_change: bool,
     #[serde(default)]
     pub quick: Vec<QuickCue>,
 }
@@ -212,6 +235,7 @@ impl Default for CueSettings {
             channel_left: 4,
             channel_right: 5,
             duck_click: false,
+            speak_key_on_change: false,
             quick: Vec::new(),
         }
     }

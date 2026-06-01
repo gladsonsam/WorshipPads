@@ -138,7 +138,14 @@ async fn state_handler(State(app): State<AppHandle>) -> impl IntoResponse {
 async fn play(State(app): State<AppHandle>, Path(key): Path<String>) -> Response {
     let core = app.state::<CoreState>();
     let engine = app.state::<AudioEngine>();
-    map_result(commands::play_key_logic(&app, core.inner(), engine.inner(), &key))
+    let synth = app.state::<CueSynth>();
+    map_result(commands::play_key_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        synth.0.as_ref(),
+        &key,
+    ))
 }
 
 async fn stop(State(app): State<AppHandle>) -> Response {

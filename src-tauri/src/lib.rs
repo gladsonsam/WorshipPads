@@ -250,6 +250,7 @@ pub fn run() {
             commands::set_cue_volume,
             commands::set_cue_channels,
             commands::set_cue_duck_click,
+            commands::set_cue_speak_key,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

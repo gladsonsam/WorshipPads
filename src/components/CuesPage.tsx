@@ -13,6 +13,7 @@ import {
   cueUpdate,
   listVoices,
   setCueRate,
+  setCueSpeakKey,
   setCueVoice,
   setCueVolume,
   type QuickCue,
@@ -74,7 +75,7 @@ export function CuesPage({
           />
           <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
             <Eyebrow style={{ letterSpacing: "0.08em" }}>Rate</Eyebrow>
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 10 }}>
               <Slider
                 value={settings.cues.rate}
                 min={-10}
@@ -125,6 +126,29 @@ export function CuesPage({
             </div>
           )}
         </div>
+      </Card>
+
+      <Card pad={24}>
+        <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 14 }}>
+          <Icon name="speaker" size={17} stroke="var(--accent-ink)" />
+          <Eyebrow style={{ letterSpacing: "0.1em" }}>Auto cues</Eyebrow>
+        </div>
+        <label className="click-toggle">
+          <input
+            type="checkbox"
+            checked={settings.cues.speak_key_on_change}
+            onChange={(e) =>
+              guard(async () => {
+                await setCueSpeakKey(e.target.checked);
+                await refreshSettings();
+              })
+            }
+          />
+          Speak key when pad changes
+        </label>
+        <p className="helper-note">
+          When you tap a new pad, the PC announces it on the cue bus (e.g. <code>Key of G</code>).
+        </p>
       </Card>
 
       <Card pad={24}>

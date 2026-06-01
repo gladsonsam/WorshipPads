@@ -54,6 +54,7 @@ pub fn play_key_logic(
     app: &AppHandle,
     core: &CoreState,
     engine: &AudioEngine,
+    synth: &dyn Synthesizer,
     key: &str,
 ) -> Result<(), String> {
     let k = Key::parse(key).ok_or_else(|| format!("unknown key '{key}'"))?;
@@ -67,9 +68,13 @@ pub fn play_key_logic(
         return stop_logic(app, core, engine);
     }
 
-    let (path, active) = {
+    let (path, active, speak_key) = {
         let s = core.settings.lock().unwrap();
-        (resolve_file(&s, k), s.active_preset.clone())
+        (
+            resolve_file(&s, k),
+            s.active_preset.clone(),
+            s.cues.speak_key_on_change,
+        )
     };
     let path = path
         .ok_or_else(|| format!("no file mapped for key {} in the active preset", k.as_str()))?;
@@ -82,6 +87,13 @@ pub fn play_key_logic(
         n.preset = active;
     }
     emit_now(app, core);
+
+    // Auto-announce the new key. Best-effort: a synthesis hiccup mustn't
+    // surface as a failed key press.
+    if speak_key {
+        let text = format!("Key of {}", k.spoken());
+        let _ = cue_speak_logic(app, core, engine, synth, &text, None);
+    }
     Ok(())
 }
 
@@ -417,9 +429,10 @@ pub fn play_key(
     app: AppHandle,
     core: State<'_, CoreState>,
     engine: State<'_, AudioEngine>,
+    synth: State<'_, CueSynth>,
     key: String,
 ) -> Result<(), String> {
-    play_key_logic(&app, core.inner(), engine.inner(), &key)
+    play_key_logic(&app, core.inner(), engine.inner(), synth.0.as_ref(), &key)
 }
 
 #[tauri::command]
@@ -814,6 +827,14 @@ pub fn set_cue_duck_click_logic(
     core.save()
 }
 
+pub fn set_cue_speak_key_logic(core: &CoreState, enabled: bool) -> Result<(), String> {
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.cues.speak_key_on_change = enabled;
+    }
+    core.save()
+}
+
 #[tauri::command]
 pub fn list_voices(synth: State<'_, CueSynth>) -> Result<Vec<VoiceInfo>, String> {
     synth.0.voices()
@@ -915,5 +936,10 @@ pub fn set_cue_duck_click(
     duck: bool,
 ) -> Result<(), String> {
     set_cue_duck_click_logic(core.inner(), engine.inner(), duck)
+}
+
+#[tauri::command]
+pub fn set_cue_speak_key(core: State<'_, CoreState>, enabled: bool) -> Result<(), String> {
+    set_cue_speak_key_logic(core.inner(), enabled)
 }
 

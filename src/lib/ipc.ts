@@ -63,6 +63,8 @@ export interface CueSettings {
   channel_left: number;
   channel_right: number;
   duck_click: boolean;
+  /** Speak "Key of X" automatically whenever a pad changes. */
+  speak_key_on_change: boolean;
   quick: QuickCue[];
 }
 
@@ -192,6 +194,9 @@ export const setCueChannels = (channelLeft: number, channelRight: number) =>
 
 export const setCueDuckClick = (duck: boolean) =>
   invoke<void>("set_cue_duck_click", { duck });
+
+export const setCueSpeakKey = (enabled: boolean) =>
+  invoke<void>("set_cue_speak_key", { enabled });
 
 /** Subscribe to live now-playing updates pushed from the backend. */
 export const onNowPlaying = (cb: (n: NowPlaying) => void): Promise<UnlistenFn> => {
