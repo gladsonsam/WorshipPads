@@ -7,6 +7,7 @@
 //! Two situations need human help, and both feed the conflict-resolution UI:
 //!   - a file whose key can't be determined at all, and
 //!   - two or more files that claim the *same* key (a conflict).
+//!
 //! In both cases the affected files land in `Preset::unmapped` rather than being
 //! silently dropped, so the user can assign them to a key by hand.
 

@@ -170,6 +170,12 @@ pub struct AudioEngine {
     events_rx: crossbeam_channel::Receiver<EngineEvent>,
 }
 
+impl Default for AudioEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AudioEngine {
     pub fn new() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -429,9 +435,11 @@ fn host_thread(
     // can re-issue build_stream with the right context.
     let mut last_host: String = String::new();
     let mut last_device: String = String::new();
-    let mut last_pad_channels: (usize, usize) = (0, 1);
-    let mut last_click_channels: (usize, usize) = (2, 3);
-    let mut last_cue_channels: (usize, usize) = (4, 5);
+    let mut last_channels = ChannelLayout {
+        pad: (0, 1),
+        click: (2, 3),
+        cue: (4, 5),
+    };
     // Click state shadow — re-applied on every stream rebuild. `enabled` is
     // deliberately not seeded from settings on boot (worship leaders shouldn't
     // be surprised by a live click on launch); the desktop/remote toggle it on.
@@ -468,22 +476,16 @@ fn host_thread(
                     accent: click_accent,
                     volume: click_volume,
                 };
-                match build_stream(
-                    &host,
-                    &device,
-                    pad_channels,
-                    click_channels,
-                    cue_channels,
-                    master,
-                    cue_volume,
-                    click_init,
-                ) {
+                let channels = ChannelLayout {
+                    pad: pad_channels,
+                    click: click_channels,
+                    cue: cue_channels,
+                };
+                match build_stream(&host, &device, channels, master, cue_volume, click_init) {
                     Ok(stream) => {
                         last_host = host;
                         last_device = device;
-                        last_pad_channels = pad_channels;
-                        last_click_channels = click_channels;
-                        last_cue_channels = cue_channels;
+                        last_channels = channels;
                         active = Some(stream);
                         let _ = reply.send(Ok(()));
                     }
@@ -505,18 +507,10 @@ fn host_thread(
                     accent: click_accent,
                     volume: click_volume,
                 };
-                match build_stream(
-                    &last_host,
-                    &last_device,
-                    last_pad_channels,
-                    channels,
-                    last_cue_channels,
-                    master,
-                    cue_volume,
-                    click_init,
-                ) {
+                let next = ChannelLayout { click: channels, ..last_channels };
+                match build_stream(&last_host, &last_device, next, master, cue_volume, click_init) {
                     Ok(stream) => {
-                        last_click_channels = channels;
+                        last_channels = next;
                         active = Some(stream);
                         let _ = reply.send(Ok(()));
                     }
@@ -538,18 +532,10 @@ fn host_thread(
                     accent: click_accent,
                     volume: click_volume,
                 };
-                match build_stream(
-                    &last_host,
-                    &last_device,
-                    last_pad_channels,
-                    last_click_channels,
-                    channels,
-                    master,
-                    cue_volume,
-                    click_init,
-                ) {
+                let next = ChannelLayout { cue: channels, ..last_channels };
+                match build_stream(&last_host, &last_device, next, master, cue_volume, click_init) {
                     Ok(stream) => {
-                        last_cue_channels = channels;
+                        last_channels = next;
                         active = Some(stream);
                         let _ = reply.send(Ok(()));
                     }
@@ -764,12 +750,29 @@ impl BusRouting {
     }
 }
 
+/// Where each of the three buses lands on the device. Computed once when the
+/// stream is built and handed to the callback.
+#[derive(Clone, Copy, Debug)]
+struct BusLayout {
+    total: usize,
+    pad: BusRouting,
+    click: BusRouting,
+    cue: BusRouting,
+}
+
+/// User-facing channel pairs for the three buses. Held by the host thread so
+/// stream rebuilds (e.g. SetClickChannels) reuse the rest of the configuration.
+#[derive(Clone, Copy, Debug)]
+struct ChannelLayout {
+    pad: (usize, usize),
+    click: (usize, usize),
+    cue: (usize, usize),
+}
+
 fn build_stream(
     host_label: &str,
     device_name: &str,
-    pad_channels: (usize, usize),
-    click_channels: (usize, usize),
-    cue_channels: (usize, usize),
+    channels: ChannelLayout,
     master: f32,
     cue_volume: f32,
     click_init: ClickInit,
@@ -786,9 +789,9 @@ fn build_stream(
     let config: cpal::StreamConfig = supported.config();
     let total_channels = config.channels as usize;
     let out_rate = config.sample_rate.0;
-    let (pad_l, pad_r) = pad_channels;
-    let (click_l, click_r) = click_channels;
-    let (cue_l, cue_r) = cue_channels;
+    let (pad_l, pad_r) = channels.pad;
+    let (click_l, click_r) = channels.click;
+    let (cue_l, cue_r) = channels.cue;
 
     if pad_l >= total_channels || pad_r >= total_channels {
         return Err(format!(
@@ -798,12 +801,15 @@ fn build_stream(
     // Click and cue channels are allowed to be out of range — the callback
     // simply doesn't write to them. Lets us silently degrade when switching
     // to a 2-channel device without rejecting the device switch entirely.
-    let pad_bus = BusRouting {
-        l: Some(pad_l),
-        r: Some(pad_r),
+    let layout = BusLayout {
+        total: total_channels,
+        pad: BusRouting {
+            l: Some(pad_l),
+            r: Some(pad_r),
+        },
+        click: BusRouting::new(click_l, click_r, total_channels),
+        cue: BusRouting::new(cue_l, cue_r, total_channels),
     };
-    let click_bus = BusRouting::new(click_l, click_r, total_channels);
-    let cue_bus = BusRouting::new(cue_l, cue_r, total_channels);
 
     let click_gen = ClickGen::new(out_rate, click_init);
 
@@ -813,31 +819,13 @@ fn build_stream(
     let err_fn = |err| eprintln!("[audio] stream error: {err}");
     let stream = match sample_format {
         SampleFormat::F32 => {
-            let cb = build_callback_f32(
-                total_channels,
-                pad_bus,
-                click_bus,
-                cue_bus,
-                master,
-                cue_volume,
-                click_gen,
-                cmd_rx,
-            );
+            let cb = build_callback_f32(layout, master, cue_volume, click_gen, cmd_rx);
             device
                 .build_output_stream(&config, cb, err_fn, None)
                 .map_err(|e| format!("build output stream (f32): {e}"))?
         }
         SampleFormat::I32 => {
-            let cb = build_callback_i32(
-                total_channels,
-                pad_bus,
-                click_bus,
-                cue_bus,
-                master,
-                cue_volume,
-                click_gen,
-                cmd_rx,
-            );
+            let cb = build_callback_i32(layout, master, cue_volume, click_gen, cmd_rx);
             device
                 .build_output_stream(&config, cb, err_fn, None)
                 .map_err(|e| format!("build output stream (i32): {e}"))?
@@ -1163,30 +1151,17 @@ fn write_pair(frame: &mut [f32], bus: BusRouting, l: f32, r: f32) {
 /// Write pad + click + cue into the right slots of `frame`. Click is mono;
 /// it's expanded by passing the same sample as l/r.
 #[inline]
-fn write_frame_f32(
-    frame: &mut [f32],
-    pad_bus: BusRouting,
-    click_bus: BusRouting,
-    cue_bus: BusRouting,
-    pad_l: f32,
-    pad_r: f32,
-    cue_l: f32,
-    cue_r: f32,
-    click: f32,
-) {
+fn write_frame_f32(frame: &mut [f32], layout: &BusLayout, mix: &MixedFrame, click: f32) {
     for sample in frame.iter_mut() {
         *sample = 0.0;
     }
-    write_pair(frame, pad_bus, pad_l, pad_r);
-    write_pair(frame, click_bus, click, click);
-    write_pair(frame, cue_bus, cue_l, cue_r);
+    write_pair(frame, layout.pad, mix.pad_l, mix.pad_r);
+    write_pair(frame, layout.click, click, click);
+    write_pair(frame, layout.cue, mix.cue_l, mix.cue_r);
 }
 
 fn build_callback_f32(
-    total_channels: usize,
-    pad_bus: BusRouting,
-    click_bus: BusRouting,
-    cue_bus: BusRouting,
+    layout: BusLayout,
     master_init: f32,
     cue_volume_init: f32,
     click_init: ClickGen,
@@ -1200,21 +1175,16 @@ fn build_callback_f32(
     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
         drain_commands(&mut voices, &mut master, &mut cue_volume, &mut click, &mut cmd_rx);
 
-        for frame in data.chunks_mut(total_channels) {
+        for frame in data.chunks_mut(layout.total) {
             let m = mix_one_frame(&mut voices, master, cue_volume);
             let c = click.next_sample();
-            write_frame_f32(
-                frame, pad_bus, click_bus, cue_bus, m.pad_l, m.pad_r, m.cue_l, m.cue_r, c,
-            );
+            write_frame_f32(frame, &layout, &m, c);
         }
     }
 }
 
 fn build_callback_i32(
-    total_channels: usize,
-    pad_bus: BusRouting,
-    click_bus: BusRouting,
-    cue_bus: BusRouting,
+    layout: BusLayout,
     master_init: f32,
     cue_volume_init: f32,
     click_init: ClickGen,
@@ -1235,15 +1205,13 @@ fn build_callback_i32(
     move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
         drain_commands(&mut voices, &mut master, &mut cue_volume, &mut click, &mut cmd_rx);
 
-        for frame in data.chunks_mut(total_channels) {
+        for frame in data.chunks_mut(layout.total) {
             let m = mix_one_frame(&mut voices, master, cue_volume);
             let c = click.next_sample();
 
             let n = frame.len().min(scratch.len());
             let scratch = &mut scratch[..n];
-            write_frame_f32(
-                scratch, pad_bus, click_bus, cue_bus, m.pad_l, m.pad_r, m.cue_l, m.cue_r, c,
-            );
+            write_frame_f32(scratch, &layout, &m, c);
 
             for (out, v) in frame.iter_mut().zip(scratch.iter()) {
                 let clipped = v.clamp(-1.0, 1.0);
