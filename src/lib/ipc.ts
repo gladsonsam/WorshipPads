@@ -71,6 +71,9 @@ export interface ClickNow {
   enabled: boolean;
   bpm: number;
   beats_per_bar: number;
+  /** Mirrors ClickSettings — broadcast so the phone remote sees desktop edits. */
+  volume: number;
+  accent: boolean;
   /** unix-epoch ms when the click was last (re)started; null when stopped. */
   started_at_ms: number | null;
 }

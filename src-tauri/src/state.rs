@@ -31,6 +31,8 @@ impl CoreState {
                 enabled: false,
                 bpm: settings.click.bpm,
                 beats_per_bar: settings.click.beats_per_bar,
+                volume: settings.click.volume,
+                accent: settings.click.accent,
                 started_at_ms: None,
             },
             ..Default::default()

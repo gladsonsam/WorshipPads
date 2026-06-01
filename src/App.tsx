@@ -670,30 +670,22 @@ function ClickCard({
       <div className="click-row" style={{ marginTop: 18 }}>
         <Icon name="speaker" size={17} stroke="var(--text-3)" />
         <Slider
-          value={Math.round(settings.click.volume * 100)}
+          value={Math.round((click?.volume ?? settings.click.volume) * 100)}
           min={0}
           max={100}
-          onChange={(v) =>
-            guard(async () => {
-              await setClickVolume(v / 100);
-              await onAfter();
-            })
-          }
+          onChange={(v) => guard(() => setClickVolume(v / 100))}
         />
-        <div className="vol-num">{Math.round(settings.click.volume * 100)}</div>
+        <div className="vol-num">
+          {Math.round((click?.volume ?? settings.click.volume) * 100)}
+        </div>
       </div>
 
       <div className="click-row" style={{ marginTop: 14, justifyContent: "space-between" }}>
         <label className="click-toggle">
           <input
             type="checkbox"
-            checked={settings.click.accent}
-            onChange={(e) =>
-              guard(async () => {
-                await setClickAccent(e.target.checked);
-                await onAfter();
-              })
-            }
+            checked={click?.accent ?? settings.click.accent}
+            onChange={(e) => guard(() => setClickAccent(e.target.checked))}
           />
           Accent on beat 1
         </label>

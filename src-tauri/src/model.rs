@@ -222,11 +222,18 @@ impl Default for NowPlaying {
 /// Live click-track state. `started_at_ms` lets clients predict the current
 /// beat locally (no per-beat broadcast) — re-set whenever the click is
 /// (re)started or its time signature changes.
+///
+/// `volume` and `accent` mirror their persisted counterparts in `ClickSettings`
+/// so connected clients (e.g. the phone remote) see those edits live over the
+/// WebSocket — broadcasting them is cheaper than asking the remote to refetch
+/// `/api/info` after every toggle.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ClickNow {
     pub enabled: bool,
     pub bpm: f32,
     pub beats_per_bar: u32,
+    pub volume: f32,
+    pub accent: bool,
     pub started_at_ms: Option<u64>,
 }
 
@@ -236,6 +243,8 @@ impl Default for ClickNow {
             enabled: false,
             bpm: 90.0,
             beats_per_bar: 4,
+            volume: 0.8,
+            accent: true,
             started_at_ms: None,
         }
     }

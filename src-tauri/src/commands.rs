@@ -504,6 +504,7 @@ pub fn set_click_accent_logic(
         let mut s = core.settings.lock().unwrap();
         s.click.accent = accent;
     }
+    core.now.lock().unwrap().click.accent = accent;
     emit_now(app, core);
     core.save()
 }
@@ -520,6 +521,7 @@ pub fn set_click_volume_logic(
         let mut s = core.settings.lock().unwrap();
         s.click.volume = volume;
     }
+    core.now.lock().unwrap().click.volume = volume;
     emit_now(app, core);
     core.save()
 }
