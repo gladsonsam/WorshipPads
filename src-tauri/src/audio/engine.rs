@@ -555,7 +555,7 @@ fn host_thread(
             }
             EngineCommand::Play(path) => {
                 if let Some(act) = active.as_mut() {
-                    let dec = decode::spawn(path, act.out_rate, true);
+                    let dec = decode::spawn(path, act.out_rate, true, false);
                     let voice = Voice {
                         consumer: dec.consumer,
                         stop: dec.stop,
@@ -582,7 +582,7 @@ fn host_thread(
                     eprintln!("[audio] PlayCue ignored: no output device configured");
                     continue;
                 };
-                let dec = decode::spawn(path, act.out_rate, false);
+                let dec = decode::spawn(path, act.out_rate, false, true);
                 let voice = Voice {
                     consumer: dec.consumer,
                     stop: dec.stop,
