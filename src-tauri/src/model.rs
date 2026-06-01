@@ -226,7 +226,9 @@ impl Default for CueSettings {
     fn default() -> Self {
         CueSettings {
             voice: None,
-            rate: 0,
+            // SAPI default rate sounds rushed for short phrases like the auto
+            // key-announcement. -1 reads as relaxed without sounding sluggish.
+            rate: -1,
             volume: 0.95,
             // Default the cue bus to channels 5/6 — most multi-out interfaces
             // have at least 6 outs and these are commonly free of the pad pair
