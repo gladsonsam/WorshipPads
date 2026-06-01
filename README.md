@@ -9,9 +9,9 @@ routes them to specific channels of any audio interface (via ASIO),
 while your phone acts as a wireless remote.
 
 <p align="center">
-  <img src="public/screenshots/app.png" alt="StagePal desktop app" width="500" />
+  <img src="public/screenshots/app1.png" alt="StagePal desktop app" width="500" />
   &nbsp;
-  <img src="public/screenshots/remote.png" alt="Phone remote" height="367" />
+  <img src="public/screenshots/remote1.png" alt="Phone remote" height="367" />
 </p>
 
 ## Features
