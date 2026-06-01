@@ -12,7 +12,7 @@
 //!     never locks, allocates, or touches the filesystem.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -444,6 +444,12 @@ fn host_thread(
     // tracked here so we can update the click ducking ramp when either changes.
     let mut duck_click_pref: bool = false;
     let mut cue_active: bool = false;
+    // Monotonic id for the in-flight cue. Each PushCue / StopCue claims a new
+    // value; the cue-watcher thread captures its id at spawn time and only
+    // fires CueEnded if it still matches. This stops a stale watcher (from a
+    // replaced or stopped cue) from clearing the "speaking" badge while a
+    // newer cue is still audible.
+    let cue_generation = Arc::new(AtomicU64::new(0));
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -597,23 +603,30 @@ fn host_thread(
                 };
                 let _ = act.cmd_tx.push(PlayCommand::PushCue(voice));
                 cue_active = true;
+                let my_gen = cue_generation.fetch_add(1, Ordering::Relaxed) + 1;
                 let _ = events.send(EngineEvent::CueStarted);
                 if duck_click_pref {
                     let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(true));
                 }
                 // Watcher: when the decoder signals "ended", give the audio
                 // buffer ~300 ms to drain, then notify upstream so NowPlaying
-                // can flip `speaking` back to false.
+                // can flip `speaking` back to false. The generation check at
+                // the end skips the notification if a newer cue has since
+                // taken over — otherwise the old watcher would clear the
+                // badge mid-way through the replacement cue.
                 let watcher_events = events.clone();
                 let watcher_ended = dec.ended;
+                let watcher_gen = cue_generation.clone();
                 std::thread::Builder::new()
                     .name("cue-watcher".into())
                     .spawn(move || {
                         while !watcher_ended.load(Ordering::Relaxed) {
-                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            std::thread::sleep(Duration::from_millis(100));
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(300));
-                        let _ = watcher_events.send(EngineEvent::CueEnded);
+                        std::thread::sleep(Duration::from_millis(300));
+                        if watcher_gen.load(Ordering::Relaxed) == my_gen {
+                            let _ = watcher_events.send(EngineEvent::CueEnded);
+                        }
                     })
                     .ok();
             }
@@ -623,6 +636,10 @@ fn host_thread(
                     let _ = act.cmd_tx.push(PlayCommand::StopCue(step));
                     if cue_active {
                         cue_active = false;
+                        // Invalidate the current watcher before firing — we're
+                        // emitting CueEnded ourselves and don't want a delayed
+                        // duplicate from the watcher.
+                        cue_generation.fetch_add(1, Ordering::Relaxed);
                         let _ = events.send(EngineEvent::CueEnded);
                     }
                     if duck_click_pref {
