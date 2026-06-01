@@ -9,7 +9,7 @@ routes them to specific channels of any audio interface (via ASIO on Windows),
 while your phone acts as a wireless remote.
 
 <p align="center">
-  <img src="public/screenshots/app.png" alt="Worship Pads desktop app" width="640" />
+  <img src="public/screenshots/app.png" alt="Worship Pads desktop app" width="500" />
   &nbsp;
   <img src="public/screenshots/remote.png" alt="Phone remote" width="200" />
 </p>
