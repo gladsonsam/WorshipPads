@@ -15,6 +15,10 @@ const DEFAULT_NOW: NowPlaying = {
     accent: true,
     started_at_ms: null,
   },
+  cue: {
+    speaking: false,
+    label: null,
+  },
 };
 
 export type ConnState = "connected" | "reconnecting";
@@ -82,10 +86,10 @@ export function useRemoteState(): RemoteState {
   return { info, now, conn };
 }
 
-/** Defensively backfill click in case an older backend omits it. */
+/** Defensively backfill click/cue in case an older backend omits them. */
 function normalize(n: NowPlaying): NowPlaying {
-  if (!n.click) {
-    return { ...n, click: DEFAULT_NOW.click };
-  }
-  return n;
+  let out = n;
+  if (!out.click) out = { ...out, click: DEFAULT_NOW.click };
+  if (!out.cue) out = { ...out, cue: DEFAULT_NOW.cue };
+  return out;
 }

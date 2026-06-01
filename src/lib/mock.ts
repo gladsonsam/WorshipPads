@@ -24,6 +24,20 @@ const settings: Settings = {
     channel_left: 2,
     channel_right: 3,
   },
+  cues: {
+    voice: null,
+    rate: 0,
+    volume: 0.95,
+    channel_left: 4,
+    channel_right: 5,
+    duck_click: false,
+    quick: [
+      { id: "q-verse-2", label: "Verse 2", text: "Verse two." },
+      { id: "q-bridge", label: "Bridge", text: "Bridge coming up." },
+      { id: "q-hold", label: "Hold", text: "Hold on this chord." },
+      { id: "q-tag", label: "Tag", text: "One more time." },
+    ],
+  },
   presets: [
     {
       id: FOLDER,
@@ -65,6 +79,10 @@ const now: NowPlaying = {
     volume: settings.click.volume,
     accent: settings.click.accent,
     started_at_ms: null,
+  },
+  cue: {
+    speaking: false,
+    label: null,
   },
 };
 

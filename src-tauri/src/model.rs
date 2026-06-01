@@ -140,6 +140,9 @@ pub struct Settings {
     /// before the click feature loadable.
     #[serde(default)]
     pub click: ClickSettings,
+    /// TTS cue config. `#[serde(default)]` keeps pre-cues settings files loadable.
+    #[serde(default)]
+    pub cues: CueSettings,
 }
 
 /// Persisted click-track configuration. The live `enabled` flag is intentionally
@@ -168,6 +171,52 @@ impl Default for ClickSettings {
     }
 }
 
+/// One saved "quick cue" — a labeled bit of text the band can speak with a tap.
+/// `id` is a short opaque string (uuid-ish), independent of label so renames
+/// don't break references from the phone remote.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct QuickCue {
+    pub id: String,
+    pub label: String,
+    pub text: String,
+}
+
+/// Persisted TTS cue config. `voice` of `None` means use the system default
+/// SAPI voice. `rate` is the SAPI rate scale, -10..10.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CueSettings {
+    #[serde(default)]
+    pub voice: Option<String>,
+    #[serde(default)]
+    pub rate: i32,
+    pub volume: f32,
+    pub channel_left: usize,
+    pub channel_right: usize,
+    /// Drop the click bus ~12 dB while a cue is speaking. Off by default.
+    #[serde(default)]
+    pub duck_click: bool,
+    #[serde(default)]
+    pub quick: Vec<QuickCue>,
+}
+
+impl Default for CueSettings {
+    fn default() -> Self {
+        CueSettings {
+            voice: None,
+            rate: 0,
+            volume: 0.95,
+            // Default the cue bus to channels 5/6 — most multi-out interfaces
+            // have at least 6 outs and these are commonly free of the pad pair
+            // (1/2) and the click pair (3/4). Falls back to silent if the
+            // device has fewer channels, like the click bus does.
+            channel_left: 4,
+            channel_right: 5,
+            duck_click: false,
+            quick: Vec::new(),
+        }
+    }
+}
+
 fn default_host() -> String {
     "WASAPI".to_string()
 }
@@ -185,6 +234,7 @@ impl Default for Settings {
             active_preset: None,
             server_port: 7777,
             click: ClickSettings::default(),
+            cues: CueSettings::default(),
         }
     }
 }
@@ -205,6 +255,8 @@ pub struct NowPlaying {
     pub playing: bool,
     #[serde(default)]
     pub click: ClickNow,
+    #[serde(default)]
+    pub cue: CueNow,
 }
 
 impl Default for NowPlaying {
@@ -215,6 +267,7 @@ impl Default for NowPlaying {
             volume: 0.8,
             playing: false,
             click: ClickNow::default(),
+            cue: CueNow::default(),
         }
     }
 }
@@ -246,6 +299,25 @@ impl Default for ClickNow {
             volume: 0.8,
             accent: true,
             started_at_ms: None,
+        }
+    }
+}
+
+/// Live TTS cue state. `speaking` flips true the moment a cue starts and back
+/// to false when it finishes (or is stopped). `label` carries the saved quick
+/// cue's label so phones can highlight which button is currently speaking; it
+/// is None for free-form text speaks.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CueNow {
+    pub speaking: bool,
+    pub label: Option<String>,
+}
+
+impl Default for CueNow {
+    fn default() -> Self {
+        CueNow {
+            speaking: false,
+            label: None,
         }
     }
 }

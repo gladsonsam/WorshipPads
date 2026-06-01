@@ -21,10 +21,18 @@ export interface ClickNow {
   started_at_ms: number | null;
 }
 
+/** Live TTS cue state. `label` is the saved quick cue's label (so the phone
+ *  can highlight which button is speaking) or null for free-form speaks. */
+export interface CueNow {
+  speaking: boolean;
+  label: string | null;
+}
+
 export interface NowPlaying {
   key: Key | null;
   preset: string | null;
   volume: number;
   playing: boolean;
   click: ClickNow;
+  cue: CueNow;
 }

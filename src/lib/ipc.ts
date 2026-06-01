@@ -20,7 +20,7 @@ function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 }
 
 export { ALL_KEYS } from "../shared/types";
-export type { Key, ClickNow, NowPlaying } from "../shared/types";
+export type { Key, ClickNow, CueNow, NowPlaying } from "../shared/types";
 
 export interface DeviceInfo {
   /** cpal host label, e.g. "WASAPI" or "ASIO". */
@@ -50,6 +50,22 @@ export interface ClickSettings {
   channel_right: number;
 }
 
+export interface QuickCue {
+  id: string;
+  label: string;
+  text: string;
+}
+
+export interface CueSettings {
+  voice: string | null;
+  rate: number;
+  volume: number;
+  channel_left: number;
+  channel_right: number;
+  duck_click: boolean;
+  quick: QuickCue[];
+}
+
 export interface Settings {
   output_host: string;
   output_device: string | null;
@@ -61,6 +77,7 @@ export interface Settings {
   active_preset: string | null;
   server_port: number;
   click: ClickSettings;
+  cues: CueSettings;
 }
 
 export interface ServerUrl {
