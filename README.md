@@ -27,7 +27,11 @@ while your phone acts as a wireless remote.
 
 ## Development
 
+Requires Node and a Rust toolchain set up for [Tauri 2](https://tauri.app/start/prerequisites/).
+The default build links ASIO via `cpal`, so it also needs the Steinberg ASIO SDK
+and `libclang` on `PATH`; pass `--no-default-features` to skip ASIO.
+
 ```bash
 npm install
-npm run tauri dev      # launches the app (starts hidden in the tray)
+npm run tauri dev
 ```
