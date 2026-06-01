@@ -125,6 +125,18 @@ fn map_result(r: Result<(), String>) -> Response {
     }
 }
 
+/// Run a sync command on the blocking pool so it doesn't pin a tokio worker.
+/// Cue synthesis shells out to PowerShell (hundreds of ms), and a few of those
+/// in flight would otherwise starve the WebSocket and HTTP handlers.
+async fn run_blocking<F>(f: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| Err(format!("remote worker panic: {e}")))
+}
+
 async fn info(State(app): State<AppHandle>) -> impl IntoResponse {
     let core = app.state::<CoreState>();
     Json(commands::build_info(core.inner()))
@@ -136,16 +148,20 @@ async fn state_handler(State(app): State<AppHandle>) -> impl IntoResponse {
 }
 
 async fn play(State(app): State<AppHandle>, Path(key): Path<String>) -> Response {
-    let core = app.state::<CoreState>();
-    let engine = app.state::<AudioEngine>();
-    let synth = app.state::<CueSynth>();
-    map_result(commands::play_key_logic(
-        &app,
-        core.inner(),
-        engine.inner(),
-        synth.0.as_ref(),
-        &key,
-    ))
+    let r = run_blocking(move || {
+        let core = app.state::<CoreState>();
+        let engine = app.state::<AudioEngine>();
+        let synth = app.state::<CueSynth>();
+        commands::play_key_logic(
+            &app,
+            core.inner(),
+            engine.inner(),
+            synth.0.as_ref(),
+            &key,
+        )
+    })
+    .await;
+    map_result(r)
 }
 
 async fn stop(State(app): State<AppHandle>) -> Response {
@@ -244,31 +260,39 @@ async fn click_volume(State(app): State<AppHandle>, Json(body): Json<VolumeBody>
 struct SpeakBody { text: String }
 
 async fn cue_speak(State(app): State<AppHandle>, Json(body): Json<SpeakBody>) -> Response {
-    let core = app.state::<CoreState>();
-    let engine = app.state::<AudioEngine>();
-    let synth = app.state::<CueSynth>();
-    map_result(commands::cue_speak_logic(
-        &app,
-        core.inner(),
-        engine.inner(),
-        synth.0.as_ref(),
-        &body.text,
-        None,
-        None,
-    ))
+    let r = run_blocking(move || {
+        let core = app.state::<CoreState>();
+        let engine = app.state::<AudioEngine>();
+        let synth = app.state::<CueSynth>();
+        commands::cue_speak_logic(
+            &app,
+            core.inner(),
+            engine.inner(),
+            synth.0.as_ref(),
+            &body.text,
+            None,
+            None,
+        )
+    })
+    .await;
+    map_result(r)
 }
 
 async fn cue_quick(State(app): State<AppHandle>, Path(id): Path<String>) -> Response {
-    let core = app.state::<CoreState>();
-    let engine = app.state::<AudioEngine>();
-    let synth = app.state::<CueSynth>();
-    map_result(commands::cue_speak_quick_logic(
-        &app,
-        core.inner(),
-        engine.inner(),
-        synth.0.as_ref(),
-        &id,
-    ))
+    let r = run_blocking(move || {
+        let core = app.state::<CoreState>();
+        let engine = app.state::<AudioEngine>();
+        let synth = app.state::<CueSynth>();
+        commands::cue_speak_quick_logic(
+            &app,
+            core.inner(),
+            engine.inner(),
+            synth.0.as_ref(),
+            &id,
+        )
+    })
+    .await;
+    map_result(r)
 }
 
 async fn cue_stop(State(app): State<AppHandle>) -> Response {
