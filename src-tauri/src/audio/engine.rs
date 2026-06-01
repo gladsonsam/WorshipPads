@@ -14,12 +14,28 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{HostId, SampleFormat};
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use rtrb::{Consumer, RingBuffer};
 use serde::Serialize;
+
+/// Upper bound on how long the caller waits for a stream rebuild. ASIO opens
+/// can be slow but should never legitimately exceed this; a broken driver that
+/// hangs longer would otherwise freeze the UI permanently.
+const STREAM_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn await_stream_reply(rx: &Receiver<Result<(), String>>) -> Result<(), String> {
+    match rx.recv_timeout(STREAM_BUILD_TIMEOUT) {
+        Ok(r) => r,
+        Err(RecvTimeoutError::Timeout) => {
+            Err("audio device took too long to open — driver may be hung".into())
+        }
+        Err(RecvTimeoutError::Disconnected) => Err("audio host thread did not reply".into()),
+    }
+}
 
 use super::decode;
 
@@ -232,9 +248,7 @@ impl AudioEngine {
                 reply,
             })
             .map_err(|_| "audio host thread is gone".to_string())?;
-        reply_rx
-            .recv()
-            .map_err(|_| "audio host thread did not reply".to_string())?
+        await_stream_reply(&reply_rx)
     }
 
     pub fn set_click_channels(&self, channels: (usize, usize)) -> Result<(), String> {
@@ -242,9 +256,7 @@ impl AudioEngine {
         self.tx
             .send(EngineCommand::SetClickChannels { channels, reply })
             .map_err(|_| "audio host thread is gone".to_string())?;
-        reply_rx
-            .recv()
-            .map_err(|_| "audio host thread did not reply".to_string())?
+        await_stream_reply(&reply_rx)
     }
 
     pub fn set_cue_channels(&self, channels: (usize, usize)) -> Result<(), String> {
@@ -252,9 +264,7 @@ impl AudioEngine {
         self.tx
             .send(EngineCommand::SetCueChannels { channels, reply })
             .map_err(|_| "audio host thread is gone".to_string())?;
-        reply_rx
-            .recv()
-            .map_err(|_| "audio host thread did not reply".to_string())?
+        await_stream_reply(&reply_rx)
     }
 
     pub fn set_click_enabled(&self, enabled: bool) -> Result<(), String> {
