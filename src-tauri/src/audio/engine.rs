@@ -788,21 +788,43 @@ fn write_frame_f32(
     for sample in frame.iter_mut() {
         *sample = 0.0;
     }
-    if pad_l_idx < frame.len() {
-        frame[pad_l_idx] += pad_l;
-    }
-    if pad_r_idx < frame.len() {
-        frame[pad_r_idx] += pad_r;
-    }
-    if let Some(i) = click_l_idx {
-        if i < frame.len() {
-            frame[i] += click;
+    // Pads: when both indexes match the user explicitly chose mono, so sum to
+    // mono at -6 dB to keep correlated material from clipping. When they
+    // differ, route stereo as-is.
+    if pad_l_idx == pad_r_idx {
+        if pad_l_idx < frame.len() {
+            frame[pad_l_idx] += 0.5 * (pad_l + pad_r);
+        }
+    } else {
+        if pad_l_idx < frame.len() {
+            frame[pad_l_idx] += pad_l;
+        }
+        if pad_r_idx < frame.len() {
+            frame[pad_r_idx] += pad_r;
         }
     }
-    if let Some(i) = click_r_idx {
-        if i < frame.len() {
-            frame[i] += click;
+    // Click is intrinsically mono. When both indexes match (or only one is
+    // present) write it once; otherwise duplicate to both channels.
+    match (click_l_idx, click_r_idx) {
+        (Some(l), Some(r)) if l == r => {
+            if l < frame.len() {
+                frame[l] += click;
+            }
         }
+        (Some(l), Some(r)) => {
+            if l < frame.len() {
+                frame[l] += click;
+            }
+            if r < frame.len() {
+                frame[r] += click;
+            }
+        }
+        (Some(i), None) | (None, Some(i)) => {
+            if i < frame.len() {
+                frame[i] += click;
+            }
+        }
+        (None, None) => {}
     }
 }
 
