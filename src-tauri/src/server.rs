@@ -56,6 +56,11 @@ pub async fn serve(app: AppHandle, port: u16) {
         .route("/api/stop", post(stop))
         .route("/api/volume", post(volume))
         .route("/api/preset/:id", post(preset))
+        .route("/api/click/enabled", post(click_enabled))
+        .route("/api/click/bpm", post(click_bpm))
+        .route("/api/click/beats", post(click_beats))
+        .route("/api/click/accent", post(click_accent))
+        .route("/api/click/volume", post(click_volume))
         .route("/ws", get(ws_upgrade))
         .layer(CorsLayer::permissive())
         .with_state(app);
@@ -159,6 +164,70 @@ async fn preset(State(app): State<AppHandle>, Path(id): Path<String>) -> Respons
     let core = app.state::<CoreState>();
     let engine = app.state::<AudioEngine>();
     map_result(commands::set_preset_logic(&app, core.inner(), engine.inner(), &id))
+}
+
+#[derive(Deserialize)]
+struct EnabledBody { enabled: bool }
+#[derive(Deserialize)]
+struct BpmBody { bpm: f32 }
+#[derive(Deserialize)]
+struct BeatsBody { beats: u32 }
+#[derive(Deserialize)]
+struct AccentBody { accent: bool }
+
+async fn click_enabled(State(app): State<AppHandle>, Json(body): Json<EnabledBody>) -> Response {
+    let core = app.state::<CoreState>();
+    let engine = app.state::<AudioEngine>();
+    map_result(commands::set_click_enabled_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        body.enabled,
+    ))
+}
+
+async fn click_bpm(State(app): State<AppHandle>, Json(body): Json<BpmBody>) -> Response {
+    let core = app.state::<CoreState>();
+    let engine = app.state::<AudioEngine>();
+    map_result(commands::set_click_bpm_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        body.bpm,
+    ))
+}
+
+async fn click_beats(State(app): State<AppHandle>, Json(body): Json<BeatsBody>) -> Response {
+    let core = app.state::<CoreState>();
+    let engine = app.state::<AudioEngine>();
+    map_result(commands::set_click_beats_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        body.beats,
+    ))
+}
+
+async fn click_accent(State(app): State<AppHandle>, Json(body): Json<AccentBody>) -> Response {
+    let core = app.state::<CoreState>();
+    let engine = app.state::<AudioEngine>();
+    map_result(commands::set_click_accent_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        body.accent,
+    ))
+}
+
+async fn click_volume(State(app): State<AppHandle>, Json(body): Json<VolumeBody>) -> Response {
+    let core = app.state::<CoreState>();
+    let engine = app.state::<AudioEngine>();
+    map_result(commands::set_click_volume_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        body.volume,
+    ))
 }
 
 async fn ws_upgrade(State(app): State<AppHandle>, ws: WebSocketUpgrade) -> Response {

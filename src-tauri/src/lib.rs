@@ -27,26 +27,37 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
-/// Re-apply saved audio settings to the engine on boot.
+/// Re-apply saved audio settings to the engine on boot. The click is restored
+/// in everything *except* its `enabled` state — we boot stopped so the user
+/// isn't surprised by a live click on launch.
 fn restore_audio(app: &tauri::AppHandle) {
     let core = app.state::<CoreState>();
     let engine = app.state::<AudioEngine>();
 
-    let (host, device, channels, volume, crossfade_ms) = {
+    let (host, device, pad_channels, click_channels, volume, crossfade_ms, click_bpm, click_beats, click_accent, click_volume) = {
         let s = core.settings.lock().unwrap();
         (
             s.output_host.clone(),
             s.output_device.clone(),
             (s.channel_left, s.channel_right),
+            (s.click.channel_left, s.click.channel_right),
             s.master_volume,
             s.crossfade_ms,
+            s.click.bpm,
+            s.click.beats_per_bar,
+            s.click.accent,
+            s.click.volume,
         )
     };
 
     let _ = engine.set_volume(volume);
     let _ = engine.set_crossfade(crossfade_ms);
+    let _ = engine.set_click_bpm(click_bpm);
+    let _ = engine.set_click_beats(click_beats);
+    let _ = engine.set_click_accent(click_accent);
+    let _ = engine.set_click_volume(click_volume);
     if let Some(device) = device {
-        if let Err(e) = engine.set_output(&host, &device, channels) {
+        if let Err(e) = engine.set_output(&host, &device, pad_channels, click_channels) {
             eprintln!("[boot] could not restore audio output '{device}' on {host}: {e}");
         }
     }
@@ -170,6 +181,12 @@ pub fn run() {
             commands::play_key,
             commands::stop,
             commands::server_url,
+            commands::set_click_enabled,
+            commands::set_click_bpm,
+            commands::set_click_beats,
+            commands::set_click_accent,
+            commands::set_click_volume,
+            commands::set_click_channels,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

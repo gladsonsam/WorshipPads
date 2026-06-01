@@ -11,7 +11,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::audio::{AudioEngine, DeviceInfo};
 use crate::library;
-use crate::model::{Key, NowPlaying, Preset, Settings};
+use crate::model::{now_unix_ms, Key, NowPlaying, Preset, Settings};
 use crate::state::CoreState;
 
 // ---------------------------------------------------------------------------
@@ -269,7 +269,20 @@ pub fn set_audio_output(
     channel_left: usize,
     channel_right: usize,
 ) -> Result<(), String> {
-    engine.set_output(&host, &device, (channel_left, channel_right))?;
+    // Snap click channels to something sensible for the new device. Keep the
+    // user's existing click pair if it still fits; otherwise default to (2,3)
+    // when the device has ≥4 channels, else fold onto (0,1) — which will mix
+    // the click into the pad bus.
+    let (click_l, click_r) = {
+        let s = core.settings.lock().unwrap();
+        (s.click.channel_left, s.click.channel_right)
+    };
+    engine.set_output(
+        &host,
+        &device,
+        (channel_left, channel_right),
+        (click_l, click_r),
+    )?;
     {
         let mut s = core.settings.lock().unwrap();
         s.output_host = host;
@@ -417,3 +430,172 @@ pub fn server_url(core: State<'_, CoreState>) -> ServerUrl {
         port,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Click track
+// ---------------------------------------------------------------------------
+
+pub fn set_click_enabled_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    enabled: bool,
+) -> Result<(), String> {
+    engine.set_click_enabled(enabled)?;
+    {
+        let mut n = core.now.lock().unwrap();
+        n.click.enabled = enabled;
+        n.click.started_at_ms = if enabled { Some(now_unix_ms()) } else { None };
+    }
+    emit_now(app, core);
+    Ok(())
+}
+
+pub fn set_click_bpm_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    bpm: f32,
+) -> Result<(), String> {
+    let bpm = bpm.clamp(20.0, 400.0);
+    engine.set_click_bpm(bpm)?;
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.click.bpm = bpm;
+    }
+    core.now.lock().unwrap().click.bpm = bpm;
+    emit_now(app, core);
+    core.save()
+}
+
+pub fn set_click_beats_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    beats: u32,
+) -> Result<(), String> {
+    let beats = beats.clamp(1, 32);
+    engine.set_click_beats(beats)?;
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.click.beats_per_bar = beats;
+    }
+    {
+        let mut n = core.now.lock().unwrap();
+        n.click.beats_per_bar = beats;
+        // Realign the visual cycle to the new signature so clients restart
+        // from beat 1 on the next predicted tick.
+        if n.click.enabled {
+            n.click.started_at_ms = Some(now_unix_ms());
+        }
+    }
+    emit_now(app, core);
+    core.save()
+}
+
+pub fn set_click_accent_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    accent: bool,
+) -> Result<(), String> {
+    engine.set_click_accent(accent)?;
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.click.accent = accent;
+    }
+    emit_now(app, core);
+    core.save()
+}
+
+pub fn set_click_volume_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    volume: f32,
+) -> Result<(), String> {
+    let volume = volume.clamp(0.0, 1.0);
+    engine.set_click_volume(volume)?;
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.click.volume = volume;
+    }
+    emit_now(app, core);
+    core.save()
+}
+
+pub fn set_click_channels_logic(
+    core: &CoreState,
+    engine: &AudioEngine,
+    channel_left: usize,
+    channel_right: usize,
+) -> Result<(), String> {
+    engine.set_click_channels((channel_left, channel_right))?;
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.click.channel_left = channel_left;
+        s.click.channel_right = channel_right;
+    }
+    core.save()
+}
+
+#[tauri::command]
+pub fn set_click_enabled(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    enabled: bool,
+) -> Result<(), String> {
+    set_click_enabled_logic(&app, core.inner(), engine.inner(), enabled)
+}
+
+#[tauri::command]
+pub fn set_click_bpm(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    bpm: f32,
+) -> Result<(), String> {
+    set_click_bpm_logic(&app, core.inner(), engine.inner(), bpm)
+}
+
+#[tauri::command]
+pub fn set_click_beats(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    beats: u32,
+) -> Result<(), String> {
+    set_click_beats_logic(&app, core.inner(), engine.inner(), beats)
+}
+
+#[tauri::command]
+pub fn set_click_accent(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    accent: bool,
+) -> Result<(), String> {
+    set_click_accent_logic(&app, core.inner(), engine.inner(), accent)
+}
+
+#[tauri::command]
+pub fn set_click_volume(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    volume: f32,
+) -> Result<(), String> {
+    set_click_volume_logic(&app, core.inner(), engine.inner(), volume)
+}
+
+#[tauri::command]
+pub fn set_click_channels(
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    channel_left: usize,
+    channel_right: usize,
+) -> Result<(), String> {
+    set_click_channels_logic(core.inner(), engine.inner(), channel_left, channel_right)
+}
+

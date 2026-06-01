@@ -3,8 +3,18 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+/// Wall-clock unix-epoch milliseconds. Used so connected clients can predict
+/// the current click beat locally without a per-beat broadcast.
+pub fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// The 12 chromatic roots. Designed to extend later with major/minor quality.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -126,6 +136,36 @@ pub struct Settings {
     pub presets: Vec<Preset>,
     pub active_preset: Option<String>,
     pub server_port: u16,
+    /// Click-track config. `#[serde(default)]` keeps settings files written
+    /// before the click feature loadable.
+    #[serde(default)]
+    pub click: ClickSettings,
+}
+
+/// Persisted click-track configuration. The live `enabled` flag is intentionally
+/// NOT persisted — the app boots with the click stopped so a worship leader
+/// isn't surprised by a live click on launch.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ClickSettings {
+    pub bpm: f32,
+    pub beats_per_bar: u32,
+    pub accent: bool,
+    pub volume: f32,
+    pub channel_left: usize,
+    pub channel_right: usize,
+}
+
+impl Default for ClickSettings {
+    fn default() -> Self {
+        ClickSettings {
+            bpm: 90.0,
+            beats_per_bar: 4,
+            accent: true,
+            volume: 0.8,
+            channel_left: 2,
+            channel_right: 3,
+        }
+    }
 }
 
 fn default_host() -> String {
@@ -144,6 +184,7 @@ impl Default for Settings {
             presets: Vec::new(),
             active_preset: None,
             server_port: 7777,
+            click: ClickSettings::default(),
         }
     }
 }
@@ -162,6 +203,8 @@ pub struct NowPlaying {
     pub preset: Option<String>,
     pub volume: f32,
     pub playing: bool,
+    #[serde(default)]
+    pub click: ClickNow,
 }
 
 impl Default for NowPlaying {
@@ -171,6 +214,29 @@ impl Default for NowPlaying {
             preset: None,
             volume: 0.8,
             playing: false,
+            click: ClickNow::default(),
+        }
+    }
+}
+
+/// Live click-track state. `started_at_ms` lets clients predict the current
+/// beat locally (no per-beat broadcast) — re-set whenever the click is
+/// (re)started or its time signature changes.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ClickNow {
+    pub enabled: bool,
+    pub bpm: f32,
+    pub beats_per_bar: u32,
+    pub started_at_ms: Option<u64>,
+}
+
+impl Default for ClickNow {
+    fn default() -> Self {
+        ClickNow {
+            enabled: false,
+            bpm: 90.0,
+            beats_per_bar: 4,
+            started_at_ms: None,
         }
     }
 }

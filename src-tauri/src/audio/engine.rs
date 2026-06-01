@@ -61,6 +61,24 @@ enum PlayCommand {
     /// Fade everything out (Stop button), at the given per-frame gain step.
     FadeOutAll(f32),
     SetMaster(f32),
+    SetClickEnabled(bool),
+    SetClickBpm(f32),
+    SetClickBeats(u32),
+    SetClickAccent(bool),
+    SetClickVolume(f32),
+}
+
+/// Initial click configuration handed to the audio callback when it's built.
+/// All subsequent edits flow through `PlayCommand::SetClick*` so the RT thread
+/// only ever updates itself; channel changes go through `SetOutput` instead
+/// since they require rebuilding the cpal stream.
+#[derive(Clone, Copy, Debug)]
+pub struct ClickInit {
+    pub enabled: bool,
+    pub bpm: f32,
+    pub beats_per_bar: u32,
+    pub accent: bool,
+    pub volume: f32,
 }
 
 /// High-level commands from the control handle to the host thread.
@@ -68,6 +86,13 @@ enum EngineCommand {
     SetOutput {
         host: String,
         device: String,
+        pad_channels: (usize, usize),
+        click_channels: (usize, usize),
+        reply: Sender<Result<(), String>>,
+    },
+    /// Change just the click channel pair; rebuilds the stream using the last
+    /// known device + pad channels + master volume + click state.
+    SetClickChannels {
         channels: (usize, usize),
         reply: Sender<Result<(), String>>,
     },
@@ -75,6 +100,11 @@ enum EngineCommand {
     Stop,
     SetVolume(f32),
     SetCrossfade(u32),
+    SetClickEnabled(bool),
+    SetClickBpm(f32),
+    SetClickBeats(u32),
+    SetClickAccent(bool),
+    SetClickVolume(f32),
 }
 
 /// Control handle. Cheap to clone-share via Tauri state.
@@ -137,20 +167,62 @@ impl AudioEngine {
         &self,
         host: &str,
         device: &str,
-        channels: (usize, usize),
+        pad_channels: (usize, usize),
+        click_channels: (usize, usize),
     ) -> Result<(), String> {
         let (reply, reply_rx) = crossbeam_channel::bounded(1);
         self.tx
             .send(EngineCommand::SetOutput {
                 host: host.to_string(),
                 device: device.to_string(),
-                channels,
+                pad_channels,
+                click_channels,
                 reply,
             })
             .map_err(|_| "audio host thread is gone".to_string())?;
         reply_rx
             .recv()
             .map_err(|_| "audio host thread did not reply".to_string())?
+    }
+
+    pub fn set_click_channels(&self, channels: (usize, usize)) -> Result<(), String> {
+        let (reply, reply_rx) = crossbeam_channel::bounded(1);
+        self.tx
+            .send(EngineCommand::SetClickChannels { channels, reply })
+            .map_err(|_| "audio host thread is gone".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "audio host thread did not reply".to_string())?
+    }
+
+    pub fn set_click_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.tx
+            .send(EngineCommand::SetClickEnabled(enabled))
+            .map_err(|_| "audio host thread is gone".to_string())
+    }
+
+    pub fn set_click_bpm(&self, bpm: f32) -> Result<(), String> {
+        self.tx
+            .send(EngineCommand::SetClickBpm(bpm))
+            .map_err(|_| "audio host thread is gone".to_string())
+    }
+
+    pub fn set_click_beats(&self, beats: u32) -> Result<(), String> {
+        self.tx
+            .send(EngineCommand::SetClickBeats(beats))
+            .map_err(|_| "audio host thread is gone".to_string())
+    }
+
+    pub fn set_click_accent(&self, accent: bool) -> Result<(), String> {
+        self.tx
+            .send(EngineCommand::SetClickAccent(accent))
+            .map_err(|_| "audio host thread is gone".to_string())
+    }
+
+    pub fn set_click_volume(&self, volume: f32) -> Result<(), String> {
+        self.tx
+            .send(EngineCommand::SetClickVolume(volume))
+            .map_err(|_| "audio host thread is gone".to_string())
     }
 
     pub fn play(&self, path: PathBuf) -> Result<(), String> {
@@ -253,17 +325,72 @@ fn host_thread(rx: Receiver<EngineCommand>) {
     let mut active: Option<ActiveStream> = None;
     let mut master: f32 = 0.8;
     let mut crossfade_ms: u32 = DEFAULT_CROSSFADE_MS;
+    // Last known device + channel layout, so SetClickChannels (and any future
+    // single-knob rebuild) can re-issue build_stream with the right context.
+    let mut last_host: String = String::new();
+    let mut last_device: String = String::new();
+    let mut last_pad_channels: (usize, usize) = (0, 1);
+    // Click state shadow — re-applied on every stream rebuild. `enabled` is
+    // deliberately not seeded from settings on boot (worship leaders shouldn't
+    // be surprised by a live click on launch); the desktop/remote toggle it on.
+    let mut click_enabled: bool = false;
+    let mut click_bpm: f32 = 90.0;
+    let mut click_beats: u32 = 4;
+    let mut click_accent: bool = true;
+    let mut click_volume: f32 = 0.8;
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
             EngineCommand::SetOutput {
                 host,
                 device,
-                channels,
+                pad_channels,
+                click_channels,
                 reply,
             } => {
-                let result = build_stream(&host, &device, channels, master);
-                match result {
+                let click_init = ClickInit {
+                    enabled: click_enabled,
+                    bpm: click_bpm,
+                    beats_per_bar: click_beats,
+                    accent: click_accent,
+                    volume: click_volume,
+                };
+                match build_stream(&host, &device, pad_channels, click_channels, master, click_init) {
+                    Ok(stream) => {
+                        last_host = host;
+                        last_device = device;
+                        last_pad_channels = pad_channels;
+                        active = Some(stream);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(e) => {
+                        active = None;
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            EngineCommand::SetClickChannels { channels, reply } => {
+                if last_device.is_empty() {
+                    // No active stream yet; the next SetOutput will pick up the
+                    // new click channels from settings. Nothing to do here.
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
+                let click_init = ClickInit {
+                    enabled: click_enabled,
+                    bpm: click_bpm,
+                    beats_per_bar: click_beats,
+                    accent: click_accent,
+                    volume: click_volume,
+                };
+                match build_stream(
+                    &last_host,
+                    &last_device,
+                    last_pad_channels,
+                    channels,
+                    master,
+                    click_init,
+                ) {
                     Ok(stream) => {
                         active = Some(stream);
                         let _ = reply.send(Ok(()));
@@ -304,6 +431,36 @@ fn host_thread(rx: Receiver<EngineCommand>) {
             }
             EngineCommand::SetCrossfade(ms) => {
                 crossfade_ms = ms.max(1);
+            }
+            EngineCommand::SetClickEnabled(en) => {
+                click_enabled = en;
+                if let Some(act) = active.as_mut() {
+                    let _ = act.cmd_tx.push(PlayCommand::SetClickEnabled(en));
+                }
+            }
+            EngineCommand::SetClickBpm(bpm) => {
+                click_bpm = bpm;
+                if let Some(act) = active.as_mut() {
+                    let _ = act.cmd_tx.push(PlayCommand::SetClickBpm(bpm));
+                }
+            }
+            EngineCommand::SetClickBeats(b) => {
+                click_beats = b;
+                if let Some(act) = active.as_mut() {
+                    let _ = act.cmd_tx.push(PlayCommand::SetClickBeats(b));
+                }
+            }
+            EngineCommand::SetClickAccent(a) => {
+                click_accent = a;
+                if let Some(act) = active.as_mut() {
+                    let _ = act.cmd_tx.push(PlayCommand::SetClickAccent(a));
+                }
+            }
+            EngineCommand::SetClickVolume(v) => {
+                click_volume = v;
+                if let Some(act) = active.as_mut() {
+                    let _ = act.cmd_tx.push(PlayCommand::SetClickVolume(v));
+                }
             }
         }
     }
@@ -355,8 +512,10 @@ fn pick_supported(
 fn build_stream(
     host_label: &str,
     device_name: &str,
-    channels: (usize, usize),
+    pad_channels: (usize, usize),
+    click_channels: (usize, usize),
     master: f32,
+    click_init: ClickInit,
 ) -> Result<ActiveStream, String> {
     let host = host_from_label(host_label)?;
     let device = host
@@ -370,13 +529,21 @@ fn build_stream(
     let config: cpal::StreamConfig = supported.config();
     let total_channels = config.channels as usize;
     let out_rate = config.sample_rate.0;
-    let (ch_l, ch_r) = channels;
+    let (pad_l, pad_r) = pad_channels;
+    let (click_l, click_r) = click_channels;
 
-    if ch_l >= total_channels || ch_r >= total_channels {
+    if pad_l >= total_channels || pad_r >= total_channels {
         return Err(format!(
-            "channel pair ({ch_l},{ch_r}) out of range; device has {total_channels} channels"
+            "pad channel pair ({pad_l},{pad_r}) out of range; device has {total_channels} channels"
         ));
     }
+    // Click channels are allowed to be out of range — the callback simply
+    // doesn't write to them. This lets us silently degrade when switching to a
+    // 2-channel device without rejecting the device switch entirely.
+    let click_l_opt = (click_l < total_channels).then_some(click_l);
+    let click_r_opt = (click_r < total_channels).then_some(click_r);
+
+    let click_gen = ClickGen::new(out_rate, click_init);
 
     // Lock-free queue: host thread → real-time callback.
     let (cmd_tx, cmd_rx) = RingBuffer::<PlayCommand>::new(64);
@@ -384,13 +551,31 @@ fn build_stream(
     let err_fn = |err| eprintln!("[audio] stream error: {err}");
     let stream = match sample_format {
         SampleFormat::F32 => {
-            let cb = build_callback_f32(total_channels, ch_l, ch_r, master, cmd_rx);
+            let cb = build_callback_f32(
+                total_channels,
+                pad_l,
+                pad_r,
+                click_l_opt,
+                click_r_opt,
+                master,
+                click_gen,
+                cmd_rx,
+            );
             device
                 .build_output_stream(&config, cb, err_fn, None)
                 .map_err(|e| format!("build output stream (f32): {e}"))?
         }
         SampleFormat::I32 => {
-            let cb = build_callback_i32(total_channels, ch_l, ch_r, master, cmd_rx);
+            let cb = build_callback_i32(
+                total_channels,
+                pad_l,
+                pad_r,
+                click_l_opt,
+                click_r_opt,
+                master,
+                click_gen,
+                cmd_rx,
+            );
             device
                 .build_output_stream(&config, cb, err_fn, None)
                 .map_err(|e| format!("build output stream (i32): {e}"))?
@@ -407,6 +592,124 @@ fn build_stream(
         cmd_tx,
         out_rate,
     })
+}
+
+/// Synthesized click. Lives entirely inside the real-time callback: no
+/// allocation, no I/O, just integer counters and a windowed sine ping per beat.
+/// A 20 ms equal-rate ramp on enable/disable keeps toggling click-free.
+struct ClickGen {
+    sample_rate: f32,
+    bpm: f32,
+    beats_per_bar: u32,
+    accent: bool,
+    volume: f32,
+    samples_per_beat: f32,
+    samples_since_beat: f32,
+    beat_index: u32,
+    // Active ping voice (one at a time — at 300 BPM the prior ping is long gone
+    // before the next one fires).
+    osc_phase: f32,    // radians, wraps at 2π
+    osc_freq: f32,     // Hz
+    osc_env: f32,      // current envelope, decays per sample
+    osc_decay: f32,    // per-sample env multiplier
+    // Enable ramp: ~20 ms equal-rate fade in/out to suppress click-on-toggle.
+    enable_ramp: f32,
+    enable_target: f32,
+    enable_step: f32,
+}
+
+impl ClickGen {
+    fn new(sample_rate: u32, init: ClickInit) -> Self {
+        let sr = sample_rate as f32;
+        let bpm = init.bpm.clamp(20.0, 400.0);
+        let beats = init.beats_per_bar.clamp(1, 32);
+        let enable_target = if init.enabled { 1.0 } else { 0.0 };
+        ClickGen {
+            sample_rate: sr,
+            bpm,
+            beats_per_bar: beats,
+            accent: init.accent,
+            volume: init.volume.clamp(0.0, 1.0),
+            samples_per_beat: 60.0 / bpm * sr,
+            // Re-arm so the first beat fires immediately on enable.
+            samples_since_beat: 60.0 / bpm * sr,
+            beat_index: 0,
+            osc_phase: 0.0,
+            osc_freq: 1500.0,
+            osc_env: 0.0,
+            osc_decay: env_decay_per_sample(sr),
+            enable_ramp: enable_target,
+            enable_target,
+            enable_step: 1.0 / (0.020 * sr).max(1.0),
+        }
+    }
+
+    fn set_bpm(&mut self, bpm: f32) {
+        self.bpm = bpm.clamp(20.0, 400.0);
+        self.samples_per_beat = 60.0 / self.bpm * self.sample_rate;
+    }
+    fn set_beats(&mut self, b: u32) {
+        self.beats_per_bar = b.clamp(1, 32);
+        if self.beat_index >= self.beats_per_bar {
+            self.beat_index = 0;
+        }
+    }
+    fn set_accent(&mut self, a: bool) {
+        self.accent = a;
+    }
+    fn set_volume(&mut self, v: f32) {
+        self.volume = v.clamp(0.0, 1.0);
+    }
+    fn set_enabled(&mut self, en: bool) {
+        self.enable_target = if en { 1.0 } else { 0.0 };
+        if en {
+            // Re-arm beat 1 to fire immediately so the user hears the click
+            // start the moment they press play.
+            self.beat_index = 0;
+            self.samples_since_beat = self.samples_per_beat;
+            self.osc_env = 0.0;
+        }
+    }
+
+    #[inline]
+    fn next_sample(&mut self) -> f32 {
+        if self.enable_ramp < self.enable_target {
+            self.enable_ramp = (self.enable_ramp + self.enable_step).min(self.enable_target);
+        } else if self.enable_ramp > self.enable_target {
+            self.enable_ramp = (self.enable_ramp - self.enable_step).max(self.enable_target);
+        }
+
+        // Fully off: skip the oscillator math entirely.
+        if self.enable_ramp <= 0.0 && self.enable_target <= 0.0 {
+            return 0.0;
+        }
+
+        if self.samples_since_beat >= self.samples_per_beat {
+            self.samples_since_beat -= self.samples_per_beat;
+            let is_one = self.beat_index == 0 && self.accent;
+            self.osc_freq = if is_one { 2000.0 } else { 1500.0 };
+            self.osc_phase = 0.0;
+            self.osc_env = if is_one { 1.0 } else { 0.7 };
+            self.beat_index = (self.beat_index + 1) % self.beats_per_bar.max(1);
+        }
+
+        let s = self.osc_phase.sin() * self.osc_env * self.volume * self.enable_ramp;
+        self.osc_phase += std::f32::consts::TAU * self.osc_freq / self.sample_rate;
+        if self.osc_phase >= std::f32::consts::TAU {
+            self.osc_phase -= std::f32::consts::TAU;
+        }
+        self.osc_env *= self.osc_decay;
+        self.samples_since_beat += 1.0;
+
+        s
+    }
+}
+
+/// Per-sample envelope multiplier so a fresh ping decays from 1.0 to ~0.001
+/// over 30 ms. Independent of BPM (the envelope IS the click).
+fn env_decay_per_sample(sample_rate: f32) -> f32 {
+    let frames = (sample_rate * 0.030).max(1.0);
+    0.001_f32.powf(1.0 / frames)
 }
 
 /// Pull one f32 stereo frame from the active voices, mixing into (mix_l, mix_r),
@@ -437,7 +740,12 @@ fn mix_one_frame(voices: &mut Vec<Voice>, master: f32) -> (f32, f32) {
 }
 
 #[inline]
-fn drain_commands(voices: &mut Vec<Voice>, master: &mut f32, cmd_rx: &mut rtrb::Consumer<PlayCommand>) {
+fn drain_commands(
+    voices: &mut Vec<Voice>,
+    master: &mut f32,
+    click: &mut ClickGen,
+    cmd_rx: &mut rtrb::Consumer<PlayCommand>,
+) {
     while let Ok(cmd) = cmd_rx.pop() {
         match cmd {
             PlayCommand::Crossfade(v) => {
@@ -455,66 +763,109 @@ fn drain_commands(voices: &mut Vec<Voice>, master: &mut f32, cmd_rx: &mut rtrb::
                 }
             }
             PlayCommand::SetMaster(m) => *master = m,
+            PlayCommand::SetClickEnabled(en) => click.set_enabled(en),
+            PlayCommand::SetClickBpm(bpm) => click.set_bpm(bpm),
+            PlayCommand::SetClickBeats(b) => click.set_beats(b),
+            PlayCommand::SetClickAccent(a) => click.set_accent(a),
+            PlayCommand::SetClickVolume(v) => click.set_volume(v),
+        }
+    }
+}
+
+/// Write `(pad_l, pad_r, click)` into the right slots of `frame`. Collisions
+/// (click channel == pad channel) sum naturally.
+#[inline]
+fn write_frame_f32(
+    frame: &mut [f32],
+    pad_l_idx: usize,
+    pad_r_idx: usize,
+    click_l_idx: Option<usize>,
+    click_r_idx: Option<usize>,
+    pad_l: f32,
+    pad_r: f32,
+    click: f32,
+) {
+    for sample in frame.iter_mut() {
+        *sample = 0.0;
+    }
+    if pad_l_idx < frame.len() {
+        frame[pad_l_idx] += pad_l;
+    }
+    if pad_r_idx < frame.len() {
+        frame[pad_r_idx] += pad_r;
+    }
+    if let Some(i) = click_l_idx {
+        if i < frame.len() {
+            frame[i] += click;
+        }
+    }
+    if let Some(i) = click_r_idx {
+        if i < frame.len() {
+            frame[i] += click;
         }
     }
 }
 
 fn build_callback_f32(
     total_channels: usize,
-    ch_l: usize,
-    ch_r: usize,
+    pad_l: usize,
+    pad_r: usize,
+    click_l: Option<usize>,
+    click_r: Option<usize>,
     master_init: f32,
+    click_init: ClickGen,
     mut cmd_rx: rtrb::Consumer<PlayCommand>,
 ) -> impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut voices: Vec<Voice> = Vec::with_capacity(4);
     let mut master = master_init;
+    let mut click = click_init;
 
     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-        drain_commands(&mut voices, &mut master, &mut cmd_rx);
+        drain_commands(&mut voices, &mut master, &mut click, &mut cmd_rx);
 
         for frame in data.chunks_mut(total_channels) {
             let (l, r) = mix_one_frame(&mut voices, master);
-            for (i, sample) in frame.iter_mut().enumerate() {
-                *sample = if i == ch_l {
-                    l
-                } else if i == ch_r {
-                    r
-                } else {
-                    0.0
-                };
-            }
+            let c = click.next_sample();
+            write_frame_f32(frame, pad_l, pad_r, click_l, click_r, l, r, c);
         }
     }
 }
 
 fn build_callback_i32(
     total_channels: usize,
-    ch_l: usize,
-    ch_r: usize,
+    pad_l: usize,
+    pad_r: usize,
+    click_l: Option<usize>,
+    click_r: Option<usize>,
     master_init: f32,
+    click_init: ClickGen,
     mut cmd_rx: rtrb::Consumer<PlayCommand>,
 ) -> impl FnMut(&mut [i32], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut voices: Vec<Voice> = Vec::with_capacity(4);
     let mut master = master_init;
+    let mut click = click_init;
 
     // i32 full-scale. Headroom of 1 sample on the negative side avoids wrap.
     const SCALE: f32 = 2_147_483_520.0;
 
+    // Scratch buffer reused per frame so we can compose the f32 sum and then
+    // convert; sized for the worst-case channel count we'll ever see.
+    let mut scratch = [0.0f32; 64];
+
     move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
-        drain_commands(&mut voices, &mut master, &mut cmd_rx);
+        drain_commands(&mut voices, &mut master, &mut click, &mut cmd_rx);
 
         for frame in data.chunks_mut(total_channels) {
             let (l, r) = mix_one_frame(&mut voices, master);
-            for (i, sample) in frame.iter_mut().enumerate() {
-                let v = if i == ch_l {
-                    l
-                } else if i == ch_r {
-                    r
-                } else {
-                    0.0
-                };
+            let c = click.next_sample();
+
+            let n = frame.len().min(scratch.len());
+            let scratch = &mut scratch[..n];
+            write_frame_f32(scratch, pad_l, pad_r, click_l, click_r, l, r, c);
+
+            for (out, v) in frame.iter_mut().zip(scratch.iter()) {
                 let clipped = v.clamp(-1.0, 1.0);
-                *sample = (clipped * SCALE) as i32;
+                *out = (clipped * SCALE) as i32;
             }
         }
     }

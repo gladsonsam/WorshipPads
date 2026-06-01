@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use tokio::sync::broadcast;
 
-use crate::model::{NowPlaying, Settings};
+use crate::model::{ClickNow, NowPlaying, Settings};
 
 pub struct CoreState {
     pub settings: Mutex<Settings>,
@@ -27,6 +27,12 @@ impl CoreState {
         let now = NowPlaying {
             volume: settings.master_volume,
             preset: settings.active_preset.clone(),
+            click: ClickNow {
+                enabled: false,
+                bpm: settings.click.bpm,
+                beats_per_bar: settings.click.beats_per_bar,
+                started_at_ms: None,
+            },
             ..Default::default()
         };
 
