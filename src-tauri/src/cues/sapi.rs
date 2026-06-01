@@ -11,10 +11,18 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use super::synth::{Synthesizer, VoiceInfo};
 
 /// Generates collision-free temp filenames within a single process lifetime.
 static SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Windows CREATE_NO_WINDOW — suppresses the console window that would
+/// otherwise flash when a GUI process spawns powershell.exe in release builds.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub struct SapiSynth;
 
@@ -108,11 +116,14 @@ fn ps_escape(s: &str) -> String {
 /// stderr text so a misconfigured SAPI install (missing voices, perms) shows
 /// up in logs.
 fn run_ps(script: &str) -> Result<String, String> {
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let output = cmd
         .output()
         .map_err(|e| format!("spawn powershell: {e}"))?;
     if !output.status.success() {
@@ -128,11 +139,14 @@ fn run_ps(script: &str) -> Result<String, String> {
 /// Same as `run_ps` but writes `stdin_bytes` to the child's stdin. Used so
 /// arbitrary user text never needs quoting on the command line.
 fn run_ps_stdin(script: &str, stdin_bytes: &[u8]) -> Result<String, String> {
-    let mut child = Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("spawn powershell: {e}"))?;
 

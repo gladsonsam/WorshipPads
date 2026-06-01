@@ -91,11 +91,11 @@ pub fn play_key_logic(
     // Auto-announce the new key. Best-effort: a synthesis hiccup mustn't
     // surface as a failed key press. The phrase is short enough that a single
     // letter at the saved rate flies past — render this one cue at a fixed
-    // slow rate (~-4) so "G" gets enough airtime to register, regardless of
+    // slow rate (~-3) so "G" gets enough airtime to register, regardless of
     // the user's saved rate for their own cues.
     if speak_key {
         let text = format!("Key of {}", k.spoken());
-        if let Err(e) = cue_speak_logic(app, core, engine, synth, &text, None, Some(-4)) {
+        if let Err(e) = cue_speak_logic(app, core, engine, synth, &text, None, Some(-3)) {
             eprintln!("[cue] auto key-announcement failed: {e}");
         }
     }
