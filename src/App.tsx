@@ -47,6 +47,7 @@ import {
   Slider,
   TapButton,
   Volume,
+  type IconName,
   type Note,
   type PadStyle,
 } from "./components/ui";
@@ -58,6 +59,10 @@ function baseName(path: string): string {
 }
 
 const PAD_STYLE_KEY = "worshippads.padStyle";
+const PAGE_KEY = "worshippads.page";
+
+type Page = "pads" | "click" | "library" | "settings";
+const PAGES: Page[] = ["pads", "click", "library", "settings"];
 
 function App() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -66,10 +71,18 @@ function App() {
   const [server, setServer] = useState<ServerUrl | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [connectOpen, setConnectOpen] = useState(false);
+  const [page, setPage] = useState<Page>(() => {
+    const saved = localStorage.getItem(PAGE_KEY);
+    return PAGES.includes(saved as Page) ? (saved as Page) : "pads";
+  });
   const [padStyle, setPadStyle] = useState<PadStyle>(
     () => (localStorage.getItem(PAD_STYLE_KEY) as PadStyle) || "grid",
   );
 
+  function navigate(p: Page) {
+    setPage(p);
+    localStorage.setItem(PAGE_KEY, p);
+  }
   function changePadStyle(v: PadStyle) {
     setPadStyle(v);
     localStorage.setItem(PAD_STYLE_KEY, v);
@@ -96,8 +109,8 @@ function App() {
     };
   }, []);
 
-  // Keyboard: Space toggles click, T taps. Both ignored when a form control
-  // is focused so editing a bank name (etc.) isn't hijacked.
+  // Keyboard: Space toggles click globally as long as no text input is focused
+  // so editing a bank name (etc.) isn't hijacked. Useful from any page.
   useEffect(() => {
     function isTextTarget(el: EventTarget | null) {
       if (!(el instanceof HTMLElement)) return false;
@@ -133,14 +146,6 @@ function App() {
     (d) => d.name === settings?.output_device && d.host === settings?.output_host,
   );
   const channelCount = selectedDevice?.channels ?? 2;
-  /** Stable composite value so the device dropdown can disambiguate same-named
-   * drivers that exist on both WASAPI and ASIO (e.g. some USB interfaces). */
-  const DEVICE_SEP = "|>|";
-  const deviceKey = (host: string, name: string): string => host + DEVICE_SEP + name;
-  const splitDeviceKey = (key: string): [string, string] => {
-    const i = key.indexOf(DEVICE_SEP);
-    return i < 0 ? ["WASAPI", key] : [key.slice(0, i), key.slice(i + DEVICE_SEP.length)];
-  };
 
   async function guard(fn: () => Promise<unknown>) {
     try {
@@ -183,274 +188,573 @@ function App() {
     );
   }
 
+  return (
+    <div className="app">
+      <header className="app-header">
+        <Mark size={42} />
+        <div className="app-title">Worship Pads</div>
+        <div style={{ flex: 1 }} />
+        <button className="btn btn-ghost" onClick={() => setConnectOpen(true)}>
+          <Icon name="phone" size={16} stroke="var(--text-2)" /> Connect phone
+        </button>
+      </header>
+
+      <div className="app-shell">
+        <nav className="sidebar" aria-label="Main navigation">
+          <NavItem icon="grid" label="Pads" active={page === "pads"} onClick={() => navigate("pads")} />
+          <NavItem icon="metronome" label="Click" active={page === "click"} onClick={() => navigate("click")} />
+          <NavItem icon="folder" label="Library" active={page === "library"} onClick={() => navigate("library")} />
+          <NavItem icon="sliders" label="Settings" active={page === "settings"} onClick={() => navigate("settings")} />
+        </nav>
+
+        <main className="page">
+          {error && <div className="error-banner">{error}</div>}
+
+          {page === "pads" && (
+            <PadsPage
+              settings={settings}
+              now={now}
+              padStyle={padStyle}
+              onPadStyleChange={changePadStyle}
+              activePreset={activePreset}
+              assignments={assignments}
+              guard={guard}
+              onGoLibrary={() => navigate("library")}
+            />
+          )}
+          {page === "click" && (
+            <ClickPage
+              settings={settings}
+              click={now?.click ?? null}
+              guard={guard}
+            />
+          )}
+          {page === "library" && (
+            <LibraryPage
+              settings={settings}
+              onAddFolder={chooseFolder}
+              guard={guard}
+              refreshSettings={refreshSettings}
+            />
+          )}
+          {page === "settings" && (
+            <SettingsPage
+              settings={settings}
+              devices={devices}
+              channelCount={channelCount}
+              guard={guard}
+              refreshSettings={refreshSettings}
+            />
+          )}
+        </main>
+      </div>
+
+      {connectOpen && (
+        <ConnectModal url={phoneUrl} addr={phoneAddr} server={server} onClose={() => setConnectOpen(false)} />
+      )}
+    </div>
+  );
+}
+
+/* ─────────────────────────── sidebar nav ──────────────────────────── */
+function NavItem({
+  icon,
+  label,
+  active,
+  onClick,
+}: {
+  icon: IconName;
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button className={`nav-item${active ? " on" : ""}`} onClick={onClick}>
+      <Icon
+        name={icon}
+        size={17}
+        stroke={active ? "var(--accent-ink)" : "var(--text-3)"}
+      />
+      <span>{label}</span>
+    </button>
+  );
+}
+
+/* ─────────────────────────── pads page ────────────────────────────── */
+function PadsPage({
+  settings,
+  now,
+  padStyle,
+  onPadStyleChange,
+  activePreset,
+  assignments,
+  guard,
+  onGoLibrary,
+}: {
+  settings: Settings;
+  now: NowPlaying | null;
+  padStyle: PadStyle;
+  onPadStyleChange: (v: PadStyle) => void;
+  activePreset: Preset | null;
+  assignments: Partial<Record<Note, string>>;
+  guard: (fn: () => Promise<unknown>) => Promise<void>;
+  onGoLibrary: () => void;
+}) {
   const playing = !!now?.playing;
   const playingKey = playing ? ((now?.key ?? null) as Note | null) : null;
   const liveVolume = Math.round((now?.volume ?? settings.master_volume) * 100);
   const mappedCount = Object.keys(assignments).length;
 
   return (
-    <div className="app">
-      <div className="app-body">
-        {/* header */}
-        <header className="app-header">
-          <Mark size={42} />
-          <div className="app-title">Worship Pads</div>
-          <div style={{ flex: 1 }} />
-          <button className="btn btn-ghost" onClick={() => setConnectOpen(true)}>
-            <Icon name="phone" size={16} stroke="var(--text-2)" /> Connect phone
+    <Card pad={28} style={{ display: "flex", flexDirection: "column" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 13, minWidth: 0 }}>
+          <span
+            className="display"
+            style={{ fontSize: 26, lineHeight: 1, whiteSpace: "nowrap" }}
+          >
+            {activePreset ? activePreset.name : "No bank selected"}
+          </span>
+          {activePreset && (
+            <span className="mono" style={{ fontSize: 12, color: "var(--text-3)" }}>
+              {mappedCount} / 12 keys
+            </span>
+          )}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <Segmented<PadStyle>
+            value={padStyle}
+            onChange={onPadStyleChange}
+            options={[
+              { key: "grid", label: "Grid", icon: "grid" },
+              { key: "piano", label: "Piano", icon: "piano" },
+            ]}
+          />
+          <Meter live={playing} h={26} />
+        </div>
+      </div>
+
+      {activePreset ? (
+        <div style={{ marginTop: 24, marginBottom: 4 }}>
+          <PadCluster
+            variant={padStyle}
+            playing={playingKey}
+            assignments={assignments}
+            cols={6}
+            h={88}
+            big
+            onTrigger={(n) => guard(() => playKey(n as Key))}
+          />
+        </div>
+      ) : (
+        <div className="pads-empty">
+          <p>Pick or add a bank in the Library to start playing.</p>
+          <button className="btn btn-accent" onClick={onGoLibrary}>
+            <Icon name="folder" size={15} stroke="var(--on-accent)" /> Open library
           </button>
-        </header>
+        </div>
+      )}
 
-        {error && <div className="error-banner">{error}</div>}
+      <div
+        style={{
+          marginTop: "auto",
+          paddingTop: 30,
+          display: "flex",
+          alignItems: "center",
+          gap: 20,
+        }}
+      >
+        <Volume
+          value={liveVolume}
+          big
+          onChange={(v) => guard(() => setVolume(v / 100))}
+        />
+        <button
+          className="btn btn-danger"
+          disabled={!playing}
+          onClick={() => guard(() => stopPads())}
+        >
+          <Icon name="power" size={16} stroke="var(--danger)" /> Stop / Fade
+        </button>
+      </div>
+    </Card>
+  );
+}
 
-        {/* main two-column grid */}
-        <div className="grid-main">
-          {/* NOW PLAYING */}
-          <Card pad={26} style={{ display: "flex", flexDirection: "column" }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <div style={{ display: "flex", alignItems: "baseline", gap: 13, minWidth: 0 }}>
-                <span
-                  className="display"
-                  style={{ fontSize: 24, lineHeight: 1, whiteSpace: "nowrap" }}
-                >
-                  {activePreset ? activePreset.name : "No bank selected"}
-                </span>
-                {activePreset && (
-                  <span className="mono" style={{ fontSize: 12, color: "var(--text-3)" }}>
-                    {mappedCount} / 12 keys
-                  </span>
-                )}
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-                <Segmented<PadStyle>
-                  value={padStyle}
-                  onChange={changePadStyle}
-                  options={[
-                    { key: "grid", label: "Grid", icon: "grid" },
-                    { key: "piano", label: "Piano", icon: "piano" },
-                  ]}
-                />
-                <Meter live={playing} h={26} />
-              </div>
-            </div>
+/* ─────────────────────────── click page ───────────────────────────── */
+function ClickPage({
+  settings,
+  click,
+  guard,
+}: {
+  settings: Settings;
+  click: NowPlaying["click"] | null;
+  guard: (fn: () => Promise<unknown>) => Promise<void>;
+}) {
+  const enabled = click?.enabled ?? false;
+  const bpm = Math.round(click?.bpm ?? settings.click.bpm);
+  const beats = click?.beats_per_bar ?? settings.click.beats_per_bar;
+  const startedAt = click?.started_at_ms ?? null;
+  const volumePct = Math.round((click?.volume ?? settings.click.volume) * 100);
 
-            <div style={{ marginTop: 20, marginBottom: 4 }}>
-              <PadCluster
-                variant={padStyle}
-                playing={playingKey}
-                assignments={assignments}
-                cols={6}
-                h={74}
-                onTrigger={(n) => guard(() => playKey(n as Key))}
-              />
-            </div>
+  return (
+    <Card pad={28} style={{ maxWidth: 520, margin: "0 auto", width: "100%" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 6 }}>
+        <Icon name="metronome" size={17} stroke="var(--accent-ink)" />
+        <Eyebrow style={{ letterSpacing: "0.1em" }}>Click</Eyebrow>
+        <div style={{ flex: 1 }} />
+        <span className="mono" style={{ fontSize: 11.5, color: "var(--text-3)" }}>
+          Space = start/stop
+        </span>
+      </div>
 
-            <div
-              style={{
-                marginTop: "auto",
-                paddingTop: 26,
-                display: "flex",
-                alignItems: "center",
-                gap: 18,
-              }}
-            >
-              <Volume
-                value={liveVolume}
-                big
-                onChange={(v) => guard(() => setVolume(v / 100))}
-              />
-              <button
-                className="btn btn-danger"
-                disabled={!playing}
-                onClick={() => guard(() => stopPads())}
-              >
-                <Icon name="power" size={16} stroke="var(--danger)" /> Stop / Fade
-              </button>
-            </div>
-          </Card>
+      <BpmDisplay value={bpm} onChange={(v) => guard(() => setClickBpm(v))} />
 
-          {/* AUDIO OUTPUT */}
-          <Card pad={22}>
-            <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 16 }}>
-              <Icon name="sliders" size={17} stroke="var(--accent-ink)" />
-              <Eyebrow style={{ letterSpacing: "0.1em" }}>Audio output</Eyebrow>
-            </div>
+      <BeatDots
+        beatsPerBar={beats}
+        bpm={bpm}
+        startedAtMs={enabled ? startedAt : null}
+      />
 
-            <SelectField
-              label="Device"
-              value={
-                settings.output_device
-                  ? deviceKey(settings.output_host, settings.output_device)
-                  : ""
-              }
-              placeholder="Select a device…"
-              options={devices.map((d) => ({
-                value: deviceKey(d.host, d.name),
-                label: `[${d.host}] ${d.name} · ${d.channels}ch @ ${Math.round(
-                  d.default_sample_rate / 1000,
-                )} kHz${d.is_default ? " — default" : ""}`,
-              }))}
-              onChange={(v) =>
+      <div className="click-row" style={{ justifyContent: "center", marginTop: 6 }}>
+        <Segmented<string>
+          value={String(beats)}
+          onChange={(v) => guard(() => setClickBeats(Number(v)))}
+          options={[
+            { key: "3", label: "3/4" },
+            { key: "4", label: "4/4" },
+            { key: "6", label: "6/8" },
+          ]}
+        />
+      </div>
+
+      <div style={{ marginTop: 16 }}>
+        <TapButton big onTap={(v) => guard(() => setClickBpm(v))} />
+      </div>
+
+      <div className="click-row" style={{ marginTop: 20 }}>
+        <Icon name="speaker" size={17} stroke="var(--text-3)" />
+        <Slider
+          value={volumePct}
+          min={0}
+          max={100}
+          onChange={(v) => guard(() => setClickVolume(v / 100))}
+        />
+        <div className="vol-num">{volumePct}</div>
+      </div>
+
+      <div className="click-row" style={{ marginTop: 16, justifyContent: "space-between" }}>
+        <label className="click-toggle">
+          <input
+            type="checkbox"
+            checked={click?.accent ?? settings.click.accent}
+            onChange={(e) => guard(() => setClickAccent(e.target.checked))}
+          />
+          Accent on beat 1
+        </label>
+        <button
+          className={enabled ? "btn btn-danger" : "btn btn-accent"}
+          onClick={() => guard(() => setClickEnabled(!enabled))}
+        >
+          <Icon
+            name={enabled ? "stop" : "play"}
+            size={14}
+            stroke={enabled ? "var(--danger)" : "var(--on-accent)"}
+          />
+          {enabled ? "Stop click" : "Start click"}
+        </button>
+      </div>
+
+      <p className="helper-note" style={{ marginTop: 18 }}>
+        Choose which output channels carry the click in Settings.
+      </p>
+    </Card>
+  );
+}
+
+/* ─────────────────────────── library page ─────────────────────────── */
+function LibraryPage({
+  settings,
+  onAddFolder,
+  guard,
+  refreshSettings,
+}: {
+  settings: Settings;
+  onAddFolder: () => Promise<void> | void;
+  guard: (fn: () => Promise<unknown>) => Promise<void>;
+  refreshSettings: () => Promise<void>;
+}) {
+  return (
+    <Card pad={24}>
+      <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 16 }}>
+        <Icon name="folder" size={17} stroke="var(--accent-ink)" />
+        <Eyebrow style={{ letterSpacing: "0.1em" }}>Pad library</Eyebrow>
+        <div style={{ flex: 1 }} />
+        <button className="btn btn-ghost" onClick={onAddFolder}>
+          <Icon name="plus" size={15} stroke="var(--text-2)" /> Add pad folder
+        </button>
+      </div>
+
+      {settings.presets.length === 0 ? (
+        <p className="empty-note">
+          No pads yet. Add a folder of audio files — keys are detected from the file names
+          (e.g. <code>C.wav</code>, <code>F# Pad.mp3</code>).
+        </p>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {settings.presets.map((p) => (
+            <Bank
+              key={p.id}
+              preset={p}
+              active={p.id === settings.active_preset}
+              onActivate={() =>
                 guard(async () => {
-                  const [host, name] = splitDeviceKey(v);
-                  // Reset routing to 1/2 on switch — channel indexes from the
-                  // previous device may not exist on the new one.
-                  await setAudioOutput(host, name, 0, 1);
+                  await setPreset(p.id);
+                  await refreshSettings();
+                })
+              }
+              onRemove={() =>
+                guard(async () => {
+                  await removePreset(p.id);
+                  await refreshSettings();
+                })
+              }
+              onRename={(name) =>
+                guard(async () => {
+                  await renamePreset(p.id, name);
+                  await refreshSettings();
+                })
+              }
+              onAssign={(key, path) =>
+                guard(async () => {
+                  await assignKey(p.id, key, path);
+                  await refreshSettings();
+                })
+              }
+              onClear={(key) =>
+                guard(async () => {
+                  await clearKey(p.id, key);
                   await refreshSettings();
                 })
               }
             />
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
 
-            <div style={{ display: "flex", gap: 12, marginTop: 14 }}>
-              <SelectField
-                label="Left → ch"
-                mono
-                style={{ width: "50%" }}
-                value={String(settings.channel_left)}
-                options={Array.from({ length: channelCount }, (_, i) => ({
-                  value: String(i),
-                  label: String(i + 1),
-                }))}
-                onChange={(v) =>
-                  guard(async () => {
-                    await setAudioOutput(
-                      settings.output_host,
-                      settings.output_device ?? "",
-                      Number(v),
-                      settings.channel_right,
-                    );
-                    await refreshSettings();
-                  })
-                }
-              />
-              <SelectField
-                label="Right → ch"
-                mono
-                style={{ width: "50%" }}
-                value={String(settings.channel_right)}
-                options={Array.from({ length: channelCount }, (_, i) => ({
-                  value: String(i),
-                  label: String(i + 1),
-                }))}
-                onChange={(v) =>
-                  guard(async () => {
-                    await setAudioOutput(
-                      settings.output_host,
-                      settings.output_device ?? "",
-                      settings.channel_left,
-                      Number(v),
-                    );
-                    await refreshSettings();
-                  })
-                }
-              />
-            </div>
+/* ─────────────────────────── settings page ────────────────────────── */
+function SettingsPage({
+  settings,
+  devices,
+  channelCount,
+  guard,
+  refreshSettings,
+}: {
+  settings: Settings;
+  devices: DeviceInfo[];
+  channelCount: number;
+  guard: (fn: () => Promise<unknown>) => Promise<void>;
+  refreshSettings: () => Promise<void>;
+}) {
+  // Stable composite value so the device dropdown can disambiguate same-named
+  // drivers that exist on both WASAPI and ASIO (e.g. some USB interfaces).
+  const DEVICE_SEP = "|>|";
+  const deviceKey = (host: string, name: string): string => host + DEVICE_SEP + name;
+  const splitDeviceKey = (key: string): [string, string] => {
+    const i = key.indexOf(DEVICE_SEP);
+    return i < 0 ? ["WASAPI", key] : [key.slice(0, i), key.slice(i + DEVICE_SEP.length)];
+  };
 
-            <div style={{ marginTop: 16 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
-                <Eyebrow style={{ letterSpacing: "0.08em" }}>Crossfade</Eyebrow>
-                <span className="mono" style={{ fontSize: 12, color: "var(--text-2)" }}>
-                  {(settings.crossfade_ms / 1000).toFixed(1)} s
-                </span>
-              </div>
-              <Slider
-                value={settings.crossfade_ms}
-                min={200}
-                max={8000}
-                step={100}
-                onChange={(ms) =>
-                  guard(async () => {
-                    await setCrossfade(ms);
-                    await refreshSettings();
-                  })
-                }
-              />
-              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 7 }}>
-                <span className="mini-label">Instant</span>
-                <span className="mini-label">Slow fade</span>
-              </div>
-            </div>
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
+      <Card pad={22}>
+        <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 16 }}>
+          <Icon name="sliders" size={17} stroke="var(--accent-ink)" />
+          <Eyebrow style={{ letterSpacing: "0.1em" }}>Output device</Eyebrow>
+        </div>
+        <SelectField
+          label="Device"
+          value={
+            settings.output_device
+              ? deviceKey(settings.output_host, settings.output_device)
+              : ""
+          }
+          placeholder="Select a device…"
+          options={devices.map((d) => ({
+            value: deviceKey(d.host, d.name),
+            label: `[${d.host}] ${d.name} · ${d.channels}ch @ ${Math.round(
+              d.default_sample_rate / 1000,
+            )} kHz${d.is_default ? " — default" : ""}`,
+          }))}
+          onChange={(v) =>
+            guard(async () => {
+              const [host, name] = splitDeviceKey(v);
+              // Reset pad routing to 1/2 on switch — channel indexes from the
+              // previous device may not exist on the new one.
+              await setAudioOutput(host, name, 0, 1);
+              await refreshSettings();
+            })
+          }
+        />
+      </Card>
 
-            <p className="helper-note">
-              Map the stereo pair to the output channels your pads should play on — e.g. a spare
-              pair on your interface, to keep them off your main mix.
-            </p>
-          </Card>
+      <Card pad={22}>
+        <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 14 }}>
+          <Icon name="waves" size={17} stroke="var(--accent-ink)" />
+          <Eyebrow style={{ letterSpacing: "0.1em" }}>Pad output</Eyebrow>
         </div>
 
-        {/* CLICK + (future) other transport cards */}
-        <div className="grid-click">
-          <ClickCard
-            settings={settings}
-            click={now?.click ?? null}
-            channelCount={channelCount}
-            onError={(e) => setError(String(e))}
-            onAfter={refreshSettings}
-          />
-        </div>
+        <RoutingPicker
+          channelCount={channelCount}
+          channelLeft={settings.channel_left}
+          channelRight={settings.channel_right}
+          onChange={(l, r) =>
+            guard(async () => {
+              await setAudioOutput(
+                settings.output_host,
+                settings.output_device ?? "",
+                l,
+                r,
+              );
+              await refreshSettings();
+            })
+          }
+        />
 
-        {/* PAD LIBRARY */}
-        <Card pad={22}>
-          <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 16 }}>
-            <Icon name="folder" size={17} stroke="var(--accent-ink)" />
-            <Eyebrow style={{ letterSpacing: "0.1em" }}>Pad library</Eyebrow>
-            <div style={{ flex: 1 }} />
-            <button className="btn btn-ghost" onClick={chooseFolder}>
-              <Icon name="plus" size={15} stroke="var(--text-2)" /> Add pad folder
-            </button>
+        <div style={{ marginTop: 20 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+            <Eyebrow style={{ letterSpacing: "0.08em" }}>Crossfade</Eyebrow>
+            <span className="mono" style={{ fontSize: 12, color: "var(--text-2)" }}>
+              {(settings.crossfade_ms / 1000).toFixed(1)} s
+            </span>
           </div>
+          <Slider
+            value={settings.crossfade_ms}
+            min={200}
+            max={8000}
+            step={100}
+            onChange={(ms) =>
+              guard(async () => {
+                await setCrossfade(ms);
+                await refreshSettings();
+              })
+            }
+          />
+          <div style={{ display: "flex", justifyContent: "space-between", marginTop: 7 }}>
+            <span className="mini-label">Instant</span>
+            <span className="mini-label">Slow fade</span>
+          </div>
+        </div>
 
-          {settings.presets.length === 0 ? (
-            <p className="empty-note">
-              No pads yet. Add a folder of audio files — keys are detected from the file names
-              (e.g. <code>C.wav</code>, <code>F# Pad.mp3</code>).
-            </p>
-          ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              {settings.presets.map((p) => (
-                <Bank
-                  key={p.id}
-                  preset={p}
-                  active={p.id === settings.active_preset}
-                  onActivate={() =>
-                    guard(async () => {
-                      await setPreset(p.id);
-                      await refreshSettings();
-                    })
-                  }
-                  onRemove={() =>
-                    guard(async () => {
-                      await removePreset(p.id);
-                      await refreshSettings();
-                    })
-                  }
-                  onRename={(name) =>
-                    guard(async () => {
-                      await renamePreset(p.id, name);
-                      await refreshSettings();
-                    })
-                  }
-                  onAssign={(key, path) =>
-                    guard(async () => {
-                      await assignKey(p.id, key, path);
-                      await refreshSettings();
-                    })
-                  }
-                  onClear={(key) =>
-                    guard(async () => {
-                      await clearKey(p.id, key);
-                      await refreshSettings();
-                    })
-                  }
-                />
-              ))}
-            </div>
-          )}
-        </Card>
+        <p className="helper-note">
+          Route the pads to a spare output pair on your interface so they don't land on
+          your main mix.
+        </p>
+      </Card>
+
+      <Card pad={22}>
+        <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 14 }}>
+          <Icon name="metronome" size={17} stroke="var(--accent-ink)" />
+          <Eyebrow style={{ letterSpacing: "0.1em" }}>Click output</Eyebrow>
+        </div>
+
+        <RoutingPicker
+          channelCount={channelCount}
+          channelLeft={settings.click.channel_left}
+          channelRight={settings.click.channel_right}
+          onChange={(l, r) =>
+            guard(async () => {
+              await setClickChannels(l, r);
+              await refreshSettings();
+            })
+          }
+        />
+
+        <p className="helper-note">
+          The click is mono. Use stereo only if your IEM bus expects a stereo pair —
+          most click busses are mono.
+        </p>
+      </Card>
+    </div>
+  );
+}
+
+/* ─────────────────────────── routing picker ───────────────────────── */
+function RoutingPicker({
+  channelCount,
+  channelLeft,
+  channelRight,
+  onChange,
+}: {
+  channelCount: number;
+  channelLeft: number;
+  channelRight: number;
+  onChange: (left: number, right: number) => void;
+}) {
+  const isMono = channelLeft === channelRight;
+  const opts = Array.from({ length: Math.max(1, channelCount) }, (_, i) => ({
+    value: String(i),
+    label: String(i + 1),
+  }));
+
+  function toMode(mode: "stereo" | "mono") {
+    if (mode === "mono") {
+      onChange(channelLeft, channelLeft);
+    } else {
+      // Pick a sensible R that differs from L. Prefer L+1; fall back to L-1
+      // when L is already on the last channel of the device.
+      let r = channelLeft + 1;
+      if (r >= channelCount) r = Math.max(0, channelLeft - 1);
+      if (r === channelLeft) r = channelLeft; // 1-channel device: no real stereo
+      onChange(channelLeft, r);
+    }
+  }
+
+  return (
+    <div>
+      <div className="routing-head">
+        <Eyebrow style={{ letterSpacing: "0.08em" }}>Mode</Eyebrow>
+        <Segmented<"stereo" | "mono">
+          value={isMono ? "mono" : "stereo"}
+          onChange={toMode}
+          options={[
+            { key: "stereo", label: "Stereo" },
+            { key: "mono", label: "Mono" },
+          ]}
+        />
       </div>
 
-      {connectOpen && (
-        <ConnectModal url={phoneUrl} addr={phoneAddr} server={server} onClose={() => setConnectOpen(false)} />
+      {isMono ? (
+        <SelectField
+          label="Channel"
+          mono
+          style={{ marginTop: 10 }}
+          value={String(channelLeft)}
+          options={opts}
+          onChange={(v) => onChange(Number(v), Number(v))}
+        />
+      ) : (
+        <div style={{ display: "flex", gap: 12, marginTop: 10 }}>
+          <SelectField
+            label="Left → ch"
+            mono
+            style={{ width: "50%" }}
+            value={String(channelLeft)}
+            options={opts}
+            onChange={(v) => onChange(Number(v), channelRight)}
+          />
+          <SelectField
+            label="Right → ch"
+            mono
+            style={{ width: "50%" }}
+            value={String(channelRight)}
+            options={opts}
+            onChange={(v) => onChange(channelLeft, Number(v))}
+          />
+        </div>
       )}
     </div>
   );
@@ -594,154 +898,6 @@ function Bank({
         </div>
       )}
     </div>
-  );
-}
-
-/* ─────────────────────────── click card ───────────────────────────── */
-function ClickCard({
-  settings,
-  click,
-  channelCount,
-  onError,
-  onAfter,
-}: {
-  settings: Settings;
-  click: NowPlaying["click"] | null;
-  channelCount: number;
-  onError: (e: unknown) => void;
-  onAfter: () => Promise<void> | void;
-}) {
-  const enabled = click?.enabled ?? false;
-  // Show the live (broadcast) BPM/beats so taps land instantly; fall back to
-  // persisted settings before the first NowPlaying snapshot arrives.
-  const bpm = Math.round(click?.bpm ?? settings.click.bpm);
-  const beats = click?.beats_per_bar ?? settings.click.beats_per_bar;
-  const startedAt = click?.started_at_ms ?? null;
-
-  async function guard(fn: () => Promise<unknown>) {
-    try {
-      await fn();
-    } catch (e) {
-      onError(e);
-    }
-  }
-
-  return (
-    <Card pad={22}>
-      <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 8 }}>
-        <Icon name="metronome" size={17} stroke="var(--accent-ink)" />
-        <Eyebrow style={{ letterSpacing: "0.1em" }}>Click</Eyebrow>
-        <div style={{ flex: 1 }} />
-        <span className="mono" style={{ fontSize: 11.5, color: "var(--text-3)" }}>
-          Space = start/stop
-        </span>
-      </div>
-
-      <BpmDisplay
-        value={bpm}
-        onChange={(v) => guard(() => setClickBpm(v))}
-      />
-
-      <BeatDots
-        beatsPerBar={beats}
-        bpm={bpm}
-        startedAtMs={enabled ? startedAt : null}
-      />
-
-      <div className="click-row" style={{ justifyContent: "center", marginTop: 6 }}>
-        <Segmented<string>
-          value={String(beats)}
-          onChange={(v) => guard(() => setClickBeats(Number(v)))}
-          options={[
-            { key: "3", label: "3/4" },
-            { key: "4", label: "4/4" },
-            { key: "6", label: "6/8" },
-          ]}
-        />
-      </div>
-
-      <div style={{ marginTop: 14 }}>
-        <TapButton
-          big
-          onTap={(v) => guard(() => setClickBpm(v))}
-        />
-      </div>
-
-      <div className="click-row" style={{ marginTop: 18 }}>
-        <Icon name="speaker" size={17} stroke="var(--text-3)" />
-        <Slider
-          value={Math.round((click?.volume ?? settings.click.volume) * 100)}
-          min={0}
-          max={100}
-          onChange={(v) => guard(() => setClickVolume(v / 100))}
-        />
-        <div className="vol-num">
-          {Math.round((click?.volume ?? settings.click.volume) * 100)}
-        </div>
-      </div>
-
-      <div className="click-row" style={{ marginTop: 14, justifyContent: "space-between" }}>
-        <label className="click-toggle">
-          <input
-            type="checkbox"
-            checked={click?.accent ?? settings.click.accent}
-            onChange={(e) => guard(() => setClickAccent(e.target.checked))}
-          />
-          Accent on beat 1
-        </label>
-        <button
-          className={enabled ? "btn btn-danger" : "btn btn-accent"}
-          onClick={() => guard(() => setClickEnabled(!enabled))}
-        >
-          <Icon
-            name={enabled ? "stop" : "play"}
-            size={14}
-            stroke={enabled ? "var(--danger)" : "var(--on-accent)"}
-          />
-          {enabled ? "Stop click" : "Start click"}
-        </button>
-      </div>
-
-      <div className="click-row" style={{ marginTop: 18, gap: 12 }}>
-        <SelectField
-          label="Click L → ch"
-          mono
-          style={{ flex: 1 }}
-          value={String(settings.click.channel_left)}
-          options={Array.from({ length: channelCount }, (_, i) => ({
-            value: String(i),
-            label: String(i + 1),
-          }))}
-          onChange={(v) =>
-            guard(async () => {
-              await setClickChannels(Number(v), settings.click.channel_right);
-              await onAfter();
-            })
-          }
-        />
-        <SelectField
-          label="Click R → ch"
-          mono
-          style={{ flex: 1 }}
-          value={String(settings.click.channel_right)}
-          options={Array.from({ length: channelCount }, (_, i) => ({
-            value: String(i),
-            label: String(i + 1),
-          }))}
-          onChange={(v) =>
-            guard(async () => {
-              await setClickChannels(settings.click.channel_left, Number(v));
-              await onAfter();
-            })
-          }
-        />
-      </div>
-
-      <p className="helper-note">
-        Routes the click to a separate output pair on the same interface as the pads —
-        e.g. send pads to FOH and click to the band's IEM bus.
-      </p>
-    </Card>
   );
 }
 

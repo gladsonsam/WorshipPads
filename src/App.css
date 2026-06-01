@@ -105,22 +105,18 @@ body {
 
 /* ─────────────────────────── layout shell ─────────────────────────── */
 .app {
-  min-height: 100%;
+  min-height: 100vh;
   display: flex;
   flex-direction: column;
-}
-.app-body {
-  flex: 1;
-  padding: 30px 38px 40px;
-  max-width: 1280px;
-  width: 100%;
-  margin: 0 auto;
 }
 .app-header {
   display: flex;
   align-items: center;
   gap: 15px;
-  margin-bottom: 26px;
+  padding: 22px 38px 14px;
+  max-width: 1280px;
+  width: 100%;
+  margin: 0 auto;
 }
 .app-title {
   font-weight: 600;
@@ -128,18 +124,106 @@ body {
   font-size: 26px;
   line-height: 1;
 }
-.grid-main {
-  display: grid;
-  grid-template-columns: 1.55fr 1fr;
+
+.app-shell {
+  flex: 1;
+  display: flex;
   gap: 22px;
-  margin-bottom: 22px;
+  padding: 8px 38px 40px;
+  max-width: 1280px;
+  width: 100%;
+  margin: 0 auto;
+  min-height: 0;
 }
+
+.sidebar {
+  width: 208px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  box-shadow: var(--shadow-sm);
+  align-self: flex-start;
+  position: sticky;
+  top: 16px;
+}
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 42px;
+  padding: 0 14px;
+  border-radius: 11px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-family: var(--sans);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-2);
+  text-align: left;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+.nav-item:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.nav-item.on {
+  background: color-mix(in oklch, var(--accent) 14%, var(--surface));
+  color: var(--accent-ink);
+}
+
+.page {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.pads-empty {
+  margin: 36px auto;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  color: var(--text-3);
+  font-size: 14px;
+}
+
+.routing-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
 @media (max-width: 880px) {
-  .grid-main {
-    grid-template-columns: 1fr;
+  .app-header,
+  .app-shell {
+    padding-left: 20px;
+    padding-right: 20px;
   }
-  .app-body {
-    padding: 24px 20px 32px;
+  .app-shell {
+    flex-direction: column;
+    gap: 14px;
+  }
+  .sidebar {
+    width: 100%;
+    flex-direction: row;
+    overflow-x: auto;
+    position: static;
+    padding: 8px;
+  }
+  .nav-item {
+    flex: 1;
+    justify-content: center;
   }
 }
 
@@ -817,18 +901,6 @@ button {
 }
 
 /* ─────────────────────────── click track card ─────────────────────── */
-.grid-click {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 22px;
-  margin-bottom: 22px;
-}
-@media (max-width: 880px) {
-  .grid-click {
-    grid-template-columns: 1fr;
-  }
-}
-
 .bpm {
   display: flex;
   align-items: center;
