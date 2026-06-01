@@ -3,8 +3,18 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+/// Wall-clock unix-epoch milliseconds. Used so connected clients can predict
+/// the current click beat locally without a per-beat broadcast.
+pub fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// The 12 chromatic roots. Designed to extend later with major/minor quality.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -69,6 +79,24 @@ impl Key {
         }
     }
 
+    /// TTS-friendly spelling — SAPI says "#" as "hash", so spell sharps out.
+    pub fn spoken(self) -> &'static str {
+        match self {
+            Key::C => "C",
+            Key::Cs => "C sharp",
+            Key::D => "D",
+            Key::Ds => "D sharp",
+            Key::E => "E",
+            Key::F => "F",
+            Key::Fs => "F sharp",
+            Key::G => "G",
+            Key::Gs => "G sharp",
+            Key::A => "A",
+            Key::As => "A sharp",
+            Key::B => "B",
+        }
+    }
+
     /// Parse a key from an API/UI string (accepts sharps and flats).
     pub fn parse(s: &str) -> Option<Key> {
         let norm = s.trim().to_lowercase();
@@ -126,6 +154,93 @@ pub struct Settings {
     pub presets: Vec<Preset>,
     pub active_preset: Option<String>,
     pub server_port: u16,
+    /// Click-track config. `#[serde(default)]` keeps settings files written
+    /// before the click feature loadable.
+    #[serde(default)]
+    pub click: ClickSettings,
+    /// TTS cue config. `#[serde(default)]` keeps pre-cues settings files loadable.
+    #[serde(default)]
+    pub cues: CueSettings,
+}
+
+/// Persisted click-track configuration. The live `enabled` flag is intentionally
+/// NOT persisted — the app boots with the click stopped so a worship leader
+/// isn't surprised by a live click on launch.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ClickSettings {
+    pub bpm: f32,
+    pub beats_per_bar: u32,
+    pub accent: bool,
+    pub volume: f32,
+    pub channel_left: usize,
+    pub channel_right: usize,
+}
+
+impl Default for ClickSettings {
+    fn default() -> Self {
+        ClickSettings {
+            bpm: 90.0,
+            beats_per_bar: 4,
+            accent: true,
+            volume: 0.8,
+            channel_left: 2,
+            channel_right: 3,
+        }
+    }
+}
+
+/// One saved "quick cue" — a labeled bit of text the band can speak with a tap.
+/// `id` is a short opaque string (uuid-ish), independent of label so renames
+/// don't break references from the phone remote.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct QuickCue {
+    pub id: String,
+    pub label: String,
+    pub text: String,
+}
+
+/// Persisted TTS cue config. `voice` of `None` means use the system default
+/// SAPI voice. `rate` is the SAPI rate scale, -10..10.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CueSettings {
+    #[serde(default)]
+    pub voice: Option<String>,
+    #[serde(default)]
+    pub rate: i32,
+    pub volume: f32,
+    pub channel_left: usize,
+    pub channel_right: usize,
+    /// Drop the click bus ~12 dB while a cue is speaking. Off by default.
+    #[serde(default)]
+    pub duck_click: bool,
+    /// Auto-announce the new key whenever a pad changes (e.g. "Key of G").
+    /// Triggered from `play_key_logic` so desktop and phone-remote presses
+    /// both fire it. Off by default.
+    #[serde(default)]
+    pub speak_key_on_change: bool,
+    #[serde(default)]
+    pub quick: Vec<QuickCue>,
+}
+
+impl Default for CueSettings {
+    fn default() -> Self {
+        CueSettings {
+            voice: None,
+            // SAPI default rate sounds rushed for short phrases like the auto
+            // key-announcement. -1 reads as relaxed without sounding sluggish.
+            rate: -1,
+            volume: 0.95,
+            // Default the cue bus to channels 5/6 — most multi-out interfaces
+            // have at least 6 outs and these are commonly free of the pad pair
+            // (1/2) and the click pair (3/4). Falls back to silent if the
+            // device has fewer channels, like the click bus does.
+            channel_left: 4,
+            channel_right: 5,
+            duck_click: false,
+            speak_key_on_change: false,
+            quick: Vec::new(),
+        }
+    }
 }
 
 fn default_host() -> String {
@@ -144,6 +259,8 @@ impl Default for Settings {
             presets: Vec::new(),
             active_preset: None,
             server_port: 7777,
+            click: ClickSettings::default(),
+            cues: CueSettings::default(),
         }
     }
 }
@@ -162,6 +279,10 @@ pub struct NowPlaying {
     pub preset: Option<String>,
     pub volume: f32,
     pub playing: bool,
+    #[serde(default)]
+    pub click: ClickNow,
+    #[serde(default)]
+    pub cue: CueNow,
 }
 
 impl Default for NowPlaying {
@@ -171,6 +292,58 @@ impl Default for NowPlaying {
             preset: None,
             volume: 0.8,
             playing: false,
+            click: ClickNow::default(),
+            cue: CueNow::default(),
+        }
+    }
+}
+
+/// Live click-track state. `started_at_ms` lets clients predict the current
+/// beat locally (no per-beat broadcast) — re-set whenever the click is
+/// (re)started or its time signature changes.
+///
+/// `volume` and `accent` mirror their persisted counterparts in `ClickSettings`
+/// so connected clients (e.g. the phone remote) see those edits live over the
+/// WebSocket — broadcasting them is cheaper than asking the remote to refetch
+/// `/api/info` after every toggle.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ClickNow {
+    pub enabled: bool,
+    pub bpm: f32,
+    pub beats_per_bar: u32,
+    pub volume: f32,
+    pub accent: bool,
+    pub started_at_ms: Option<u64>,
+}
+
+impl Default for ClickNow {
+    fn default() -> Self {
+        ClickNow {
+            enabled: false,
+            bpm: 90.0,
+            beats_per_bar: 4,
+            volume: 0.8,
+            accent: true,
+            started_at_ms: None,
+        }
+    }
+}
+
+/// Live TTS cue state. `speaking` flips true the moment a cue starts and back
+/// to false when it finishes (or is stopped). `label` carries the saved quick
+/// cue's label so phones can highlight which button is currently speaking; it
+/// is None for free-form text speaks.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CueNow {
+    pub speaking: bool,
+    pub label: Option<String>,
+}
+
+impl Default for CueNow {
+    fn default() -> Self {
+        CueNow {
+            speaking: false,
+            label: None,
         }
     }
 }

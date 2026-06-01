@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use worshippads_lib::audio::AudioEngine;
+use stagepal_lib::audio::AudioEngine;
 
 fn main() {
     println!("== output devices ==");
@@ -37,7 +37,7 @@ fn main() {
     println!("\nwrote test tone: {tone:?}");
 
     let engine = AudioEngine::new();
-    if let Err(e) = engine.set_output(&dev.name, (0, 1)) {
+    if let Err(e) = engine.set_output(&dev.host, &dev.name, (0, 1), (2, 3), (4, 5)) {
         eprintln!("set_output failed: {e}");
         return;
     }

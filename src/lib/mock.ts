@@ -16,6 +16,29 @@ const settings: Settings = {
   master_volume: 0.8,
   active_preset: FOLDER,
   server_port: 7777,
+  click: {
+    bpm: 90,
+    beats_per_bar: 4,
+    accent: true,
+    volume: 0.8,
+    channel_left: 2,
+    channel_right: 3,
+  },
+  cues: {
+    voice: null,
+    rate: 0,
+    volume: 0.95,
+    channel_left: 4,
+    channel_right: 5,
+    duck_click: false,
+    speak_key_on_change: false,
+    quick: [
+      { id: "q-verse-2", label: "Verse 2", text: "Verse two." },
+      { id: "q-bridge", label: "Bridge", text: "Bridge coming up." },
+      { id: "q-hold", label: "Hold", text: "Hold on this chord." },
+      { id: "q-tag", label: "Tag", text: "One more time." },
+    ],
+  },
   presets: [
     {
       id: FOLDER,
@@ -50,6 +73,18 @@ const now: NowPlaying = {
   preset: settings.active_preset,
   volume: settings.master_volume,
   playing: false,
+  click: {
+    enabled: false,
+    bpm: settings.click.bpm,
+    beats_per_bar: settings.click.beats_per_bar,
+    volume: settings.click.volume,
+    accent: settings.click.accent,
+    started_at_ms: null,
+  },
+  cue: {
+    speaking: false,
+    label: null,
+  },
 };
 
 const devices: DeviceInfo[] = [
@@ -105,11 +140,24 @@ export async function mockInvoke<T>(cmd: string, args: Record<string, unknown> =
       if (now.playing && now.key === a.key) {
         now.playing = false;
         now.key = null;
+        emit();
       } else {
         now.key = a.key;
         now.playing = true;
+        emit();
+        if (settings.cues.speak_key_on_change) {
+          const spoken = String(a.key).replace("#", " sharp");
+          const label = `Key of ${spoken}`;
+          now.cue.speaking = true;
+          now.cue.label = label;
+          emit();
+          setTimeout(() => {
+            now.cue.speaking = false;
+            now.cue.label = null;
+            emit();
+          }, 1200);
+        }
       }
-      emit();
       return undefined as T;
     }
     case "stop":
@@ -167,6 +215,107 @@ export async function mockInvoke<T>(cmd: string, args: Record<string, unknown> =
     }
     case "scan_library":
       return (preset() ?? settings.presets[0]) as T;
+    case "set_click_enabled":
+      now.click.enabled = !!a.enabled;
+      now.click.started_at_ms = now.click.enabled ? Date.now() : null;
+      emit();
+      return undefined as T;
+    case "set_click_bpm":
+      settings.click.bpm = a.bpm;
+      now.click.bpm = a.bpm;
+      emit();
+      return undefined as T;
+    case "set_click_beats":
+      settings.click.beats_per_bar = a.beats;
+      now.click.beats_per_bar = a.beats;
+      if (now.click.enabled) now.click.started_at_ms = Date.now();
+      emit();
+      return undefined as T;
+    case "set_click_accent":
+      settings.click.accent = !!a.accent;
+      now.click.accent = !!a.accent;
+      emit();
+      return undefined as T;
+    case "set_click_volume":
+      settings.click.volume = a.volume;
+      now.click.volume = a.volume;
+      emit();
+      return undefined as T;
+    case "set_click_channels":
+      settings.click.channel_left = a.channelLeft;
+      settings.click.channel_right = a.channelRight;
+      return undefined as T;
+    case "list_voices":
+      return [
+        { id: "Microsoft David Desktop", name: "Microsoft David Desktop" },
+        { id: "Microsoft Zira Desktop", name: "Microsoft Zira Desktop" },
+      ] as T;
+    case "cue_speak":
+    case "cue_speak_quick": {
+      const label =
+        cmd === "cue_speak_quick"
+          ? settings.cues.quick.find((q) => q.id === a.id)?.label ?? null
+          : null;
+      now.cue.speaking = true;
+      now.cue.label = label;
+      emit();
+      // Fake a ~1.2s spoken length so the UI flips back automatically.
+      setTimeout(() => {
+        now.cue.speaking = false;
+        now.cue.label = null;
+        emit();
+      }, 1200);
+      return undefined as T;
+    }
+    case "cue_stop":
+      now.cue.speaking = false;
+      now.cue.label = null;
+      emit();
+      return undefined as T;
+    case "cue_add": {
+      const id = `q-${Date.now().toString(16)}`;
+      const cue = { id, label: a.label, text: a.text };
+      settings.cues.quick.push(cue);
+      return cue as T;
+    }
+    case "cue_update": {
+      const c = settings.cues.quick.find((q) => q.id === a.id);
+      if (c) {
+        c.label = a.label;
+        c.text = a.text;
+      }
+      return undefined as T;
+    }
+    case "cue_remove":
+      settings.cues.quick = settings.cues.quick.filter((q) => q.id !== a.id);
+      return undefined as T;
+    case "cue_move": {
+      const from = settings.cues.quick.findIndex((q) => q.id === a.id);
+      if (from < 0) return undefined as T;
+      const [item] = settings.cues.quick.splice(from, 1);
+      const to = Math.min(a.toIndex, settings.cues.quick.length);
+      settings.cues.quick.splice(to, 0, item);
+      return undefined as T;
+    }
+    case "set_cue_voice":
+      settings.cues.voice = a.voice ?? null;
+      return undefined as T;
+    case "set_cue_rate":
+      settings.cues.rate = a.rate;
+      return undefined as T;
+    case "set_cue_volume":
+      settings.cues.volume = a.volume;
+      return undefined as T;
+    case "set_cue_channels":
+      settings.cues.channel_left = a.channelLeft;
+      settings.cues.channel_right = a.channelRight;
+      return undefined as T;
+    case "set_cue_duck_click":
+      settings.cues.duck_click = !!a.duck;
+      return undefined as T;
+    case "set_cue_speak_key":
+      settings.cues.speak_key_on_change = !!a.enabled;
+      return undefined as T;
     default:
       return undefined as T;
   }

@@ -3,6 +3,7 @@
 
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { Key, NowPlaying } from "../shared/types";
 
 // In a dev build running outside Tauri (a plain browser), fall back to an
 // in-memory mock so the UI is fully explorable. Production builds always run
@@ -18,13 +19,8 @@ function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   return tauriInvoke<T>(cmd, args);
 }
 
-export type Key =
-  | "C" | "C#" | "D" | "D#" | "E" | "F"
-  | "F#" | "G" | "G#" | "A" | "A#" | "B";
-
-export const ALL_KEYS: Key[] = [
-  "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-];
+export { ALL_KEYS } from "../shared/types";
+export type { Key, ClickNow, CueNow, NowPlaying } from "../shared/types";
 
 export interface DeviceInfo {
   /** cpal host label, e.g. "WASAPI" or "ASIO". */
@@ -45,6 +41,33 @@ export interface Preset {
   unmapped: string[];
 }
 
+export interface ClickSettings {
+  bpm: number;
+  beats_per_bar: number;
+  accent: boolean;
+  volume: number;
+  channel_left: number;
+  channel_right: number;
+}
+
+export interface QuickCue {
+  id: string;
+  label: string;
+  text: string;
+}
+
+export interface CueSettings {
+  voice: string | null;
+  rate: number;
+  volume: number;
+  channel_left: number;
+  channel_right: number;
+  duck_click: boolean;
+  /** Speak "Key of X" automatically whenever a pad changes. */
+  speak_key_on_change: boolean;
+  quick: QuickCue[];
+}
+
 export interface Settings {
   output_host: string;
   output_device: string | null;
@@ -55,13 +78,8 @@ export interface Settings {
   presets: Preset[];
   active_preset: string | null;
   server_port: number;
-}
-
-export interface NowPlaying {
-  key: Key | null;
-  preset: string | null;
-  volume: number;
-  playing: boolean;
+  click: ClickSettings;
+  cues: CueSettings;
 }
 
 export interface ServerUrl {
@@ -112,6 +130,73 @@ export const playKey = (key: Key) => invoke<void>("play_key", { key });
 export const stopPads = () => invoke<void>("stop");
 
 export const getServerUrl = () => invoke<ServerUrl>("server_url");
+
+/** Start or stop the click. Independent of pad transport. */
+export const setClickEnabled = (enabled: boolean) =>
+  invoke<void>("set_click_enabled", { enabled });
+
+export const setClickBpm = (bpm: number) =>
+  invoke<void>("set_click_bpm", { bpm });
+
+export const setClickBeats = (beats: number) =>
+  invoke<void>("set_click_beats", { beats });
+
+export const setClickAccent = (accent: boolean) =>
+  invoke<void>("set_click_accent", { accent });
+
+export const setClickVolume = (volume: number) =>
+  invoke<void>("set_click_volume", { volume });
+
+export const setClickChannels = (channelLeft: number, channelRight: number) =>
+  invoke<void>("set_click_channels", { channelLeft, channelRight });
+
+/* ── Cues ─────────────────────────────────────────────────────────── */
+
+export interface VoiceInfo {
+  id: string;
+  name: string;
+}
+
+export const listVoices = () => invoke<VoiceInfo[]>("list_voices");
+
+/** Speak free-form text. Renders TTS to a temp WAV then plays it on the cue bus. */
+export const cueSpeak = (text: string) => invoke<void>("cue_speak", { text });
+
+/** Speak a saved quick cue by id. */
+export const cueSpeakQuick = (id: string) =>
+  invoke<void>("cue_speak_quick", { id });
+
+/** Cut any in-flight cue immediately. */
+export const cueStop = () => invoke<void>("cue_stop");
+
+export const cueAdd = (label: string, text: string) =>
+  invoke<QuickCue>("cue_add", { label, text });
+
+export const cueUpdate = (id: string, label: string, text: string) =>
+  invoke<void>("cue_update", { id, label, text });
+
+export const cueRemove = (id: string) => invoke<void>("cue_remove", { id });
+
+export const cueMove = (id: string, toIndex: number) =>
+  invoke<void>("cue_move", { id, toIndex });
+
+export const setCueVoice = (voice: string | null) =>
+  invoke<void>("set_cue_voice", { voice });
+
+export const setCueRate = (rate: number) =>
+  invoke<void>("set_cue_rate", { rate });
+
+export const setCueVolume = (volume: number) =>
+  invoke<void>("set_cue_volume", { volume });
+
+export const setCueChannels = (channelLeft: number, channelRight: number) =>
+  invoke<void>("set_cue_channels", { channelLeft, channelRight });
+
+export const setCueDuckClick = (duck: boolean) =>
+  invoke<void>("set_cue_duck_click", { duck });
+
+export const setCueSpeakKey = (enabled: boolean) =>
+  invoke<void>("set_cue_speak_key", { enabled });
 
 /** Subscribe to live now-playing updates pushed from the backend. */
 export const onNowPlaying = (cb: (n: NowPlaying) => void): Promise<UnlistenFn> => {

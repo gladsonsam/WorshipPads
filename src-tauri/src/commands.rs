@@ -10,9 +10,15 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::audio::{AudioEngine, DeviceInfo};
+use crate::cues::{self, Synthesizer, VoiceInfo};
 use crate::library;
-use crate::model::{Key, NowPlaying, Preset, Settings};
+use crate::model::{now_unix_ms, Key, NowPlaying, Preset, QuickCue, Settings};
 use crate::state::CoreState;
+
+/// Wrapper around the active TTS synthesizer so it can be `manage()`'d as
+/// Tauri state. Trait-object so swapping in a non-SAPI backend is just a
+/// matter of constructing a different `Box<dyn Synthesizer>` at setup.
+pub struct CueSynth(pub Box<dyn Synthesizer>);
 
 // ---------------------------------------------------------------------------
 // Shared logic (used by both Tauri commands and the web server)
@@ -48,6 +54,7 @@ pub fn play_key_logic(
     app: &AppHandle,
     core: &CoreState,
     engine: &AudioEngine,
+    synth: &dyn Synthesizer,
     key: &str,
 ) -> Result<(), String> {
     let k = Key::parse(key).ok_or_else(|| format!("unknown key '{key}'"))?;
@@ -61,9 +68,13 @@ pub fn play_key_logic(
         return stop_logic(app, core, engine);
     }
 
-    let (path, active) = {
+    let (path, active, speak_key) = {
         let s = core.settings.lock().unwrap();
-        (resolve_file(&s, k), s.active_preset.clone())
+        (
+            resolve_file(&s, k),
+            s.active_preset.clone(),
+            s.cues.speak_key_on_change,
+        )
     };
     let path = path
         .ok_or_else(|| format!("no file mapped for key {} in the active preset", k.as_str()))?;
@@ -76,6 +87,18 @@ pub fn play_key_logic(
         n.preset = active;
     }
     emit_now(app, core);
+
+    // Auto-announce the new key. Best-effort: a synthesis hiccup mustn't
+    // surface as a failed key press. The phrase is short enough that a single
+    // letter at the saved rate flies past — render this one cue at a fixed
+    // slow rate (~-4) so "G" gets enough airtime to register, regardless of
+    // the user's saved rate for their own cues.
+    if speak_key {
+        let text = format!("Key of {}", k.spoken());
+        if let Err(e) = cue_speak_logic(app, core, engine, synth, &text, None, Some(-4)) {
+            eprintln!("[cue] auto key-announcement failed: {e}");
+        }
+    }
     Ok(())
 }
 
@@ -199,6 +222,9 @@ pub struct Info {
     /// Active preset's key → file name (just the file name, no path), so the
     /// phone remote can label each pad like the desktop does.
     pub files: std::collections::HashMap<String, String>,
+    /// Saved quick cues, so the phone can render its button grid from a
+    /// single fetch instead of /api/info + /api/cues.
+    pub cues_quick: Vec<QuickCue>,
     pub now: NowPlaying,
 }
 
@@ -231,12 +257,14 @@ pub fn build_info(core: &CoreState) -> Info {
                 .collect()
         })
         .unwrap_or_default();
+    let cues_quick = s.cues.quick.clone();
     Info {
         keys: Key::ALL.iter().map(|k| k.as_str()).collect(),
         presets,
         active_preset: s.active_preset.clone(),
         mapped_keys,
         files,
+        cues_quick,
         now,
     }
 }
@@ -269,7 +297,26 @@ pub fn set_audio_output(
     channel_left: usize,
     channel_right: usize,
 ) -> Result<(), String> {
-    engine.set_output(&host, &device, (channel_left, channel_right))?;
+    // Snap click channels to something sensible for the new device. Keep the
+    // user's existing click pair if it still fits; otherwise default to (2,3)
+    // when the device has ≥4 channels, else fold onto (0,1) — which will mix
+    // the click into the pad bus.
+    let (click_l, click_r, cue_l, cue_r) = {
+        let s = core.settings.lock().unwrap();
+        (
+            s.click.channel_left,
+            s.click.channel_right,
+            s.cues.channel_left,
+            s.cues.channel_right,
+        )
+    };
+    engine.set_output(
+        &host,
+        &device,
+        (channel_left, channel_right),
+        (click_l, click_r),
+        (cue_l, cue_r),
+    )?;
     {
         let mut s = core.settings.lock().unwrap();
         s.output_host = host;
@@ -387,9 +434,10 @@ pub fn play_key(
     app: AppHandle,
     core: State<'_, CoreState>,
     engine: State<'_, AudioEngine>,
+    synth: State<'_, CueSynth>,
     key: String,
 ) -> Result<(), String> {
-    play_key_logic(&app, core.inner(), engine.inner(), &key)
+    play_key_logic(&app, core.inner(), engine.inner(), synth.0.as_ref(), &key)
 }
 
 #[tauri::command]
@@ -417,3 +465,491 @@ pub fn server_url(core: State<'_, CoreState>) -> ServerUrl {
         port,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Click track
+// ---------------------------------------------------------------------------
+
+pub fn set_click_enabled_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    enabled: bool,
+) -> Result<(), String> {
+    engine.set_click_enabled(enabled)?;
+    {
+        let mut n = core.now.lock().unwrap();
+        n.click.enabled = enabled;
+        n.click.started_at_ms = if enabled { Some(now_unix_ms()) } else { None };
+    }
+    emit_now(app, core);
+    Ok(())
+}
+
+pub fn set_click_bpm_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    bpm: f32,
+) -> Result<(), String> {
+    let bpm = bpm.clamp(20.0, 400.0);
+    engine.set_click_bpm(bpm)?;
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.click.bpm = bpm;
+    }
+    core.now.lock().unwrap().click.bpm = bpm;
+    emit_now(app, core);
+    core.save()
+}
+
+pub fn set_click_beats_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    beats: u32,
+) -> Result<(), String> {
+    let beats = beats.clamp(1, 32);
+    engine.set_click_beats(beats)?;
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.click.beats_per_bar = beats;
+    }
+    {
+        let mut n = core.now.lock().unwrap();
+        n.click.beats_per_bar = beats;
+        // Realign the visual cycle to the new signature so clients restart
+        // from beat 1 on the next predicted tick.
+        if n.click.enabled {
+            n.click.started_at_ms = Some(now_unix_ms());
+        }
+    }
+    emit_now(app, core);
+    core.save()
+}
+
+pub fn set_click_accent_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    accent: bool,
+) -> Result<(), String> {
+    engine.set_click_accent(accent)?;
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.click.accent = accent;
+    }
+    core.now.lock().unwrap().click.accent = accent;
+    emit_now(app, core);
+    core.save()
+}
+
+pub fn set_click_volume_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    volume: f32,
+) -> Result<(), String> {
+    let volume = volume.clamp(0.0, 1.0);
+    engine.set_click_volume(volume)?;
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.click.volume = volume;
+    }
+    core.now.lock().unwrap().click.volume = volume;
+    emit_now(app, core);
+    core.save()
+}
+
+pub fn set_click_channels_logic(
+    core: &CoreState,
+    engine: &AudioEngine,
+    channel_left: usize,
+    channel_right: usize,
+) -> Result<(), String> {
+    engine.set_click_channels((channel_left, channel_right))?;
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.click.channel_left = channel_left;
+        s.click.channel_right = channel_right;
+    }
+    core.save()
+}
+
+#[tauri::command]
+pub fn set_click_enabled(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    enabled: bool,
+) -> Result<(), String> {
+    set_click_enabled_logic(&app, core.inner(), engine.inner(), enabled)
+}
+
+#[tauri::command]
+pub fn set_click_bpm(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    bpm: f32,
+) -> Result<(), String> {
+    set_click_bpm_logic(&app, core.inner(), engine.inner(), bpm)
+}
+
+#[tauri::command]
+pub fn set_click_beats(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    beats: u32,
+) -> Result<(), String> {
+    set_click_beats_logic(&app, core.inner(), engine.inner(), beats)
+}
+
+#[tauri::command]
+pub fn set_click_accent(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    accent: bool,
+) -> Result<(), String> {
+    set_click_accent_logic(&app, core.inner(), engine.inner(), accent)
+}
+
+#[tauri::command]
+pub fn set_click_volume(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    volume: f32,
+) -> Result<(), String> {
+    set_click_volume_logic(&app, core.inner(), engine.inner(), volume)
+}
+
+#[tauri::command]
+pub fn set_click_channels(
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    channel_left: usize,
+    channel_right: usize,
+) -> Result<(), String> {
+    set_click_channels_logic(core.inner(), engine.inner(), channel_left, channel_right)
+}
+
+// ---------------------------------------------------------------------------
+// Cues (TTS)
+// ---------------------------------------------------------------------------
+
+/// Render the given text to a temp WAV and ask the audio engine to play it on
+/// the cue bus. Sets `now.cue.speaking = true` synchronously so the UI flips
+/// the moment the user taps; the matching `false` flip arrives via the
+/// engine's `CueEnded` event (see lib.rs setup).
+///
+/// `rate_override` bypasses the user's saved cue rate — used by the auto
+/// key-announcement so the short phrase doesn't fly past.
+pub fn cue_speak_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    synth: &dyn Synthesizer,
+    text: &str,
+    label: Option<String>,
+    rate_override: Option<i32>,
+) -> Result<(), String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("nothing to speak".into());
+    }
+    let (voice, saved_rate) = {
+        let s = core.settings.lock().unwrap();
+        (s.cues.voice.clone(), s.cues.rate)
+    };
+    let rate = rate_override.unwrap_or(saved_rate).clamp(-10, 10);
+    let out = cues::sapi_temp_wav_path();
+    synth.synth_to_wav(trimmed, voice.as_deref(), rate, &out)?;
+    engine.play_cue(out)?;
+    {
+        let mut n = core.now.lock().unwrap();
+        n.cue.speaking = true;
+        n.cue.label = label;
+    }
+    emit_now(app, core);
+    Ok(())
+}
+
+pub fn cue_stop_logic(app: &AppHandle, core: &CoreState, engine: &AudioEngine) -> Result<(), String> {
+    engine.stop_cue()?;
+    {
+        let mut n = core.now.lock().unwrap();
+        n.cue.speaking = false;
+        n.cue.label = None;
+    }
+    emit_now(app, core);
+    Ok(())
+}
+
+pub fn cue_speak_quick_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+    synth: &dyn Synthesizer,
+    id: &str,
+) -> Result<(), String> {
+    let cue = {
+        let s = core.settings.lock().unwrap();
+        s.cues
+            .quick
+            .iter()
+            .find(|c| c.id == id)
+            .cloned()
+            .ok_or_else(|| format!("no quick cue '{id}'"))?
+    };
+    cue_speak_logic(app, core, engine, synth, &cue.text, Some(cue.label), None)
+}
+
+/// Mint a short opaque id from the current time so quick cues survive
+/// rename/edit without breaking phone references.
+fn new_cue_id() -> String {
+    let n = now_unix_ms();
+    format!("q-{n:x}")
+}
+
+pub fn cue_add_logic(core: &CoreState, label: String, text: String) -> Result<QuickCue, String> {
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return Err("label cannot be empty".into());
+    }
+    let cue = QuickCue {
+        id: new_cue_id(),
+        label,
+        text,
+    };
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.cues.quick.push(cue.clone());
+    }
+    core.save()?;
+    Ok(cue)
+}
+
+pub fn cue_update_logic(
+    core: &CoreState,
+    id: &str,
+    label: String,
+    text: String,
+) -> Result<(), String> {
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return Err("label cannot be empty".into());
+    }
+    {
+        let mut s = core.settings.lock().unwrap();
+        let c = s
+            .cues
+            .quick
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or_else(|| format!("no quick cue '{id}'"))?;
+        c.label = label;
+        c.text = text;
+    }
+    core.save()
+}
+
+pub fn cue_remove_logic(core: &CoreState, id: &str) -> Result<(), String> {
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.cues.quick.retain(|c| c.id != id);
+    }
+    core.save()
+}
+
+/// Move the cue with `id` to `to_index`. Indexes past the end clamp to the
+/// end; negative not handled (caller uses usize).
+pub fn cue_move_logic(core: &CoreState, id: &str, to_index: usize) -> Result<(), String> {
+    {
+        let mut s = core.settings.lock().unwrap();
+        let Some(from) = s.cues.quick.iter().position(|c| c.id == id) else {
+            return Err(format!("no quick cue '{id}'"));
+        };
+        let item = s.cues.quick.remove(from);
+        let to = to_index.min(s.cues.quick.len());
+        s.cues.quick.insert(to, item);
+    }
+    core.save()
+}
+
+pub fn set_cue_voice_logic(core: &CoreState, voice: Option<String>) -> Result<(), String> {
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.cues.voice = voice.filter(|v| !v.trim().is_empty());
+    }
+    core.save()
+}
+
+pub fn set_cue_rate_logic(core: &CoreState, rate: i32) -> Result<(), String> {
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.cues.rate = rate.clamp(-10, 10);
+    }
+    core.save()
+}
+
+pub fn set_cue_volume_logic(
+    core: &CoreState,
+    engine: &AudioEngine,
+    volume: f32,
+) -> Result<(), String> {
+    let v = volume.clamp(0.0, 1.0);
+    engine.set_cue_volume(v)?;
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.cues.volume = v;
+    }
+    core.save()
+}
+
+pub fn set_cue_channels_logic(
+    core: &CoreState,
+    engine: &AudioEngine,
+    channel_left: usize,
+    channel_right: usize,
+) -> Result<(), String> {
+    engine.set_cue_channels((channel_left, channel_right))?;
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.cues.channel_left = channel_left;
+        s.cues.channel_right = channel_right;
+    }
+    core.save()
+}
+
+pub fn set_cue_duck_click_logic(
+    core: &CoreState,
+    engine: &AudioEngine,
+    duck: bool,
+) -> Result<(), String> {
+    engine.set_duck_click(duck)?;
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.cues.duck_click = duck;
+    }
+    core.save()
+}
+
+pub fn set_cue_speak_key_logic(core: &CoreState, enabled: bool) -> Result<(), String> {
+    {
+        let mut s = core.settings.lock().unwrap();
+        s.cues.speak_key_on_change = enabled;
+    }
+    core.save()
+}
+
+#[tauri::command]
+pub fn list_voices(synth: State<'_, CueSynth>) -> Result<Vec<VoiceInfo>, String> {
+    synth.0.voices()
+}
+
+#[tauri::command]
+pub fn cue_speak(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    synth: State<'_, CueSynth>,
+    text: String,
+) -> Result<(), String> {
+    cue_speak_logic(&app, core.inner(), engine.inner(), synth.0.as_ref(), &text, None, None)
+}
+
+#[tauri::command]
+pub fn cue_speak_quick(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    synth: State<'_, CueSynth>,
+    id: String,
+) -> Result<(), String> {
+    cue_speak_quick_logic(&app, core.inner(), engine.inner(), synth.0.as_ref(), &id)
+}
+
+#[tauri::command]
+pub fn cue_stop(
+    app: AppHandle,
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+) -> Result<(), String> {
+    cue_stop_logic(&app, core.inner(), engine.inner())
+}
+
+#[tauri::command]
+pub fn cue_add(
+    core: State<'_, CoreState>,
+    label: String,
+    text: String,
+) -> Result<QuickCue, String> {
+    cue_add_logic(core.inner(), label, text)
+}
+
+#[tauri::command]
+pub fn cue_update(
+    core: State<'_, CoreState>,
+    id: String,
+    label: String,
+    text: String,
+) -> Result<(), String> {
+    cue_update_logic(core.inner(), &id, label, text)
+}
+
+#[tauri::command]
+pub fn cue_remove(core: State<'_, CoreState>, id: String) -> Result<(), String> {
+    cue_remove_logic(core.inner(), &id)
+}
+
+#[tauri::command]
+pub fn cue_move(core: State<'_, CoreState>, id: String, to_index: usize) -> Result<(), String> {
+    cue_move_logic(core.inner(), &id, to_index)
+}
+
+#[tauri::command]
+pub fn set_cue_voice(core: State<'_, CoreState>, voice: Option<String>) -> Result<(), String> {
+    set_cue_voice_logic(core.inner(), voice)
+}
+
+#[tauri::command]
+pub fn set_cue_rate(core: State<'_, CoreState>, rate: i32) -> Result<(), String> {
+    set_cue_rate_logic(core.inner(), rate)
+}
+
+#[tauri::command]
+pub fn set_cue_volume(
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    volume: f32,
+) -> Result<(), String> {
+    set_cue_volume_logic(core.inner(), engine.inner(), volume)
+}
+
+#[tauri::command]
+pub fn set_cue_channels(
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    channel_left: usize,
+    channel_right: usize,
+) -> Result<(), String> {
+    set_cue_channels_logic(core.inner(), engine.inner(), channel_left, channel_right)
+}
+
+#[tauri::command]
+pub fn set_cue_duck_click(
+    core: State<'_, CoreState>,
+    engine: State<'_, AudioEngine>,
+    duck: bool,
+) -> Result<(), String> {
+    set_cue_duck_click_logic(core.inner(), engine.inner(), duck)
+}
+
+#[tauri::command]
+pub fn set_cue_speak_key(core: State<'_, CoreState>, enabled: bool) -> Result<(), String> {
+    set_cue_speak_key_logic(core.inner(), enabled)
+}
+

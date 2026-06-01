@@ -1,11 +1,14 @@
 {
-  "name": "worshippads",
+  "name": "stagepal",
   "private": true,
   "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "dev:tauri": "npm run build:remote && vite",
+    "dev:remote": "vite --config vite.remote.config.ts",
+    "build": "tsc && vite build && vite build --config vite.remote.config.ts",
+    "build:remote": "vite build --config vite.remote.config.ts",
     "preview": "vite preview",
     "tauri": "tauri",
     "version": "node scripts/sync-cargo-version.mjs && git add src-tauri/Cargo.toml"
@@ -27,6 +30,7 @@
     "@vitejs/plugin-react": "^4.6.0",
     "sharp": "^0.34.5",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4"
+    "vite": "^7.0.4",
+    "vite-plugin-singlefile": "^2.3.3"
   }
 }

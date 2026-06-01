@@ -1,16 +1,18 @@
-// Worship Pads — Tauri backend entrypoint.
+// StagePal — Tauri backend entrypoint.
 // Phase 1: hidden-on-boot, system tray, single instance, autostart.
 // Phase 2: audio engine (device routing + crossfade playback).
 // Phase 3: core state, presets/library, settings persistence.
 
 pub mod audio;
 mod commands;
+pub mod cues;
 pub mod library;
 pub mod model;
 mod server;
 mod state;
 
 use audio::AudioEngine;
+use cues::SapiSynth;
 use state::CoreState;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -27,26 +29,56 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
-/// Re-apply saved audio settings to the engine on boot.
+/// Re-apply saved audio settings to the engine on boot. The click is restored
+/// in everything *except* its `enabled` state — we boot stopped so the user
+/// isn't surprised by a live click on launch.
 fn restore_audio(app: &tauri::AppHandle) {
     let core = app.state::<CoreState>();
     let engine = app.state::<AudioEngine>();
 
-    let (host, device, channels, volume, crossfade_ms) = {
+    let (
+        host,
+        device,
+        pad_channels,
+        click_channels,
+        cue_channels,
+        volume,
+        cue_volume,
+        crossfade_ms,
+        click_bpm,
+        click_beats,
+        click_accent,
+        click_volume,
+        duck_click,
+    ) = {
         let s = core.settings.lock().unwrap();
         (
             s.output_host.clone(),
             s.output_device.clone(),
             (s.channel_left, s.channel_right),
+            (s.click.channel_left, s.click.channel_right),
+            (s.cues.channel_left, s.cues.channel_right),
             s.master_volume,
+            s.cues.volume,
             s.crossfade_ms,
+            s.click.bpm,
+            s.click.beats_per_bar,
+            s.click.accent,
+            s.click.volume,
+            s.cues.duck_click,
         )
     };
 
     let _ = engine.set_volume(volume);
+    let _ = engine.set_cue_volume(cue_volume);
     let _ = engine.set_crossfade(crossfade_ms);
+    let _ = engine.set_click_bpm(click_bpm);
+    let _ = engine.set_click_beats(click_beats);
+    let _ = engine.set_click_accent(click_accent);
+    let _ = engine.set_click_volume(click_volume);
+    let _ = engine.set_duck_click(duck_click);
     if let Some(device) = device {
-        if let Err(e) = engine.set_output(&host, &device, channels) {
+        if let Err(e) = engine.set_output(&host, &device, pad_channels, click_channels, cue_channels) {
             eprintln!("[boot] could not restore audio output '{device}' on {host}: {e}");
         }
     }
@@ -69,6 +101,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(AudioEngine::new())
+        .manage(commands::CueSynth(Box::new(SapiSynth::new())))
         .setup(|app| {
             // Load persisted settings into managed CoreState.
             let config_path = app
@@ -80,6 +113,50 @@ pub fn run() {
 
             // Re-bind the saved audio device/channels/volume.
             restore_audio(app.handle());
+
+            // Pre-warm SAPI. The first PowerShell + System.Speech invocation
+            // costs ~2–4 s on a cold system, which made the first auto-cue
+            // ("Key of G") feel silent until the user touched something else.
+            // A throwaway voice listing on a background thread loads the OS
+            // caches so the first real cue lands instantly.
+            let app_for_warm = app.handle().clone();
+            std::thread::Builder::new()
+                .name("sapi-prewarm".into())
+                .spawn(move || {
+                    let synth = app_for_warm.state::<commands::CueSynth>();
+                    if let Err(e) = synth.0.voices() {
+                        eprintln!("[boot] sapi prewarm: {e}");
+                    }
+                })
+                .ok();
+
+            // Bridge the audio engine's upstream events (cue started / ended)
+            // to NowPlaying broadcasts so every connected client sees the
+            // `cue.speaking` flag flip when a cue finishes.
+            let events = app.state::<AudioEngine>().events();
+            let app_for_events = app.handle().clone();
+            std::thread::Builder::new()
+                .name("engine-events".into())
+                .spawn(move || {
+                    while let Ok(ev) = events.recv() {
+                        match ev {
+                            audio::EngineEvent::CueStarted => {
+                                // commands.rs flips speaking=true synchronously
+                                // before calling play_cue, so no work here.
+                            }
+                            audio::EngineEvent::CueEnded => {
+                                let core = app_for_events.state::<CoreState>();
+                                {
+                                    let mut n = core.now.lock().unwrap();
+                                    n.cue.speaking = false;
+                                    n.cue.label = None;
+                                }
+                                commands::emit_now(&app_for_events, core.inner());
+                            }
+                        }
+                    }
+                })
+                .ok();
 
             // Start the phone-remote web server on the configured port.
             let port = app
@@ -124,7 +201,7 @@ pub fn run() {
 
             TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("Worship Pads")
+                .tooltip("StagePal")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -170,6 +247,26 @@ pub fn run() {
             commands::play_key,
             commands::stop,
             commands::server_url,
+            commands::set_click_enabled,
+            commands::set_click_bpm,
+            commands::set_click_beats,
+            commands::set_click_accent,
+            commands::set_click_volume,
+            commands::set_click_channels,
+            commands::list_voices,
+            commands::cue_speak,
+            commands::cue_speak_quick,
+            commands::cue_stop,
+            commands::cue_add,
+            commands::cue_update,
+            commands::cue_remove,
+            commands::cue_move,
+            commands::set_cue_voice,
+            commands::set_cue_rate,
+            commands::set_cue_volume,
+            commands::set_cue_channels,
+            commands::set_cue_duck_click,
+            commands::set_cue_speak_key,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

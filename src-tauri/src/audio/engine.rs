@@ -35,10 +35,22 @@ pub struct DeviceInfo {
     pub is_default: bool,
 }
 
-/// One looping source plus its current gain ramp.
+/// Which mixed-output bus a voice routes into. Pads and cues mix into separate
+/// stereo pairs so a tech can park them on different IEM auxes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VoiceBus {
+    Pad,
+    Cue,
+}
+
+/// One source (looping pad or one-shot cue) plus its current gain ramp.
 struct Voice {
     consumer: Consumer<f32>,
     stop: Arc<AtomicBool>,
+    /// Set true by the decoder thread the moment it has stopped producing.
+    /// One-shots use this to drop themselves once their tail has drained.
+    ended: Arc<AtomicBool>,
+    bus: VoiceBus,
     gain: f32,
     target: f32,
     /// Per-frame gain increment magnitude.
@@ -56,11 +68,37 @@ impl Drop for Voice {
 
 /// Commands sent into the real-time callback via a lock-free queue.
 enum PlayCommand {
-    /// Fade in this new voice while fading out all existing voices.
+    /// Fade in this new pad voice while fading out all existing pad voices.
     Crossfade(Voice),
-    /// Fade everything out (Stop button), at the given per-frame gain step.
+    /// Drop in a new one-shot cue voice. Replaces any prior cue voice.
+    PushCue(Voice),
+    /// Fade all pad voices out (Stop button), at the given per-frame gain step.
     FadeOutAll(f32),
+    /// Stop any in-flight cue.
+    StopCue(f32),
     SetMaster(f32),
+    SetCueVolume(f32),
+    SetClickEnabled(bool),
+    SetClickBpm(f32),
+    SetClickBeats(u32),
+    SetClickAccent(bool),
+    SetClickVolume(f32),
+    /// Toggle the cue→click ducking ramp (true while a cue is speaking AND
+    /// the user has duck_click enabled).
+    SetClickDuckActive(bool),
+}
+
+/// Initial click configuration handed to the audio callback when it's built.
+/// All subsequent edits flow through `PlayCommand::SetClick*` so the RT thread
+/// only ever updates itself; channel changes go through `SetOutput` instead
+/// since they require rebuilding the cpal stream.
+#[derive(Clone, Copy, Debug)]
+pub struct ClickInit {
+    pub enabled: bool,
+    pub bpm: f32,
+    pub beats_per_bar: u32,
+    pub accent: bool,
+    pub volume: f32,
 }
 
 /// High-level commands from the control handle to the host thread.
@@ -68,28 +106,70 @@ enum EngineCommand {
     SetOutput {
         host: String,
         device: String,
+        pad_channels: (usize, usize),
+        click_channels: (usize, usize),
+        cue_channels: (usize, usize),
+        reply: Sender<Result<(), String>>,
+    },
+    /// Change just the click channel pair; rebuilds the stream using the last
+    /// known device + pad channels + cue channels + master volume + click state.
+    SetClickChannels {
+        channels: (usize, usize),
+        reply: Sender<Result<(), String>>,
+    },
+    /// Change just the cue channel pair; rebuilds the stream similarly.
+    SetCueChannels {
         channels: (usize, usize),
         reply: Sender<Result<(), String>>,
     },
     Play(PathBuf),
     Stop,
+    PlayCue(PathBuf),
+    StopCue,
     SetVolume(f32),
+    SetCueVolume(f32),
     SetCrossfade(u32),
+    SetClickEnabled(bool),
+    SetClickBpm(f32),
+    SetClickBeats(u32),
+    SetClickAccent(bool),
+    SetClickVolume(f32),
+    /// Persisted "duck the click while a cue speaks" toggle.
+    SetDuckClick(bool),
+}
+
+/// Events the engine pushes upstream so commands.rs can broadcast NowPlaying
+/// edges (cue started/ended) without polling.
+#[derive(Clone, Copy, Debug)]
+pub enum EngineEvent {
+    CueStarted,
+    CueEnded,
 }
 
 /// Control handle. Cheap to clone-share via Tauri state.
 pub struct AudioEngine {
     tx: Sender<EngineCommand>,
+    /// Events from the engine to anyone who wants them (one consumer at a
+    /// time; commands.rs owns the receive side).
+    events_rx: crossbeam_channel::Receiver<EngineEvent>,
 }
 
 impl AudioEngine {
     pub fn new() -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
+        let (events_tx, events_rx) = crossbeam_channel::unbounded();
         std::thread::Builder::new()
             .name("audio-host".into())
-            .spawn(move || host_thread(rx))
+            .spawn(move || host_thread(rx, events_tx))
             .expect("failed to spawn audio host thread");
-        AudioEngine { tx }
+        AudioEngine { tx, events_rx }
+    }
+
+    /// Borrow the upstream event stream. Cloneable (crossbeam Receiver),
+    /// but the audio host only ever sends one of each event so only one
+    /// listener should typically drain it.
+    pub fn events(&self) -> crossbeam_channel::Receiver<EngineEvent> {
+        self.events_rx.clone()
     }
 
     /// Enumerate output devices across every cpal host available on this
@@ -137,20 +217,74 @@ impl AudioEngine {
         &self,
         host: &str,
         device: &str,
-        channels: (usize, usize),
+        pad_channels: (usize, usize),
+        click_channels: (usize, usize),
+        cue_channels: (usize, usize),
     ) -> Result<(), String> {
         let (reply, reply_rx) = crossbeam_channel::bounded(1);
         self.tx
             .send(EngineCommand::SetOutput {
                 host: host.to_string(),
                 device: device.to_string(),
-                channels,
+                pad_channels,
+                click_channels,
+                cue_channels,
                 reply,
             })
             .map_err(|_| "audio host thread is gone".to_string())?;
         reply_rx
             .recv()
             .map_err(|_| "audio host thread did not reply".to_string())?
+    }
+
+    pub fn set_click_channels(&self, channels: (usize, usize)) -> Result<(), String> {
+        let (reply, reply_rx) = crossbeam_channel::bounded(1);
+        self.tx
+            .send(EngineCommand::SetClickChannels { channels, reply })
+            .map_err(|_| "audio host thread is gone".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "audio host thread did not reply".to_string())?
+    }
+
+    pub fn set_cue_channels(&self, channels: (usize, usize)) -> Result<(), String> {
+        let (reply, reply_rx) = crossbeam_channel::bounded(1);
+        self.tx
+            .send(EngineCommand::SetCueChannels { channels, reply })
+            .map_err(|_| "audio host thread is gone".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "audio host thread did not reply".to_string())?
+    }
+
+    pub fn set_click_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.tx
+            .send(EngineCommand::SetClickEnabled(enabled))
+            .map_err(|_| "audio host thread is gone".to_string())
+    }
+
+    pub fn set_click_bpm(&self, bpm: f32) -> Result<(), String> {
+        self.tx
+            .send(EngineCommand::SetClickBpm(bpm))
+            .map_err(|_| "audio host thread is gone".to_string())
+    }
+
+    pub fn set_click_beats(&self, beats: u32) -> Result<(), String> {
+        self.tx
+            .send(EngineCommand::SetClickBeats(beats))
+            .map_err(|_| "audio host thread is gone".to_string())
+    }
+
+    pub fn set_click_accent(&self, accent: bool) -> Result<(), String> {
+        self.tx
+            .send(EngineCommand::SetClickAccent(accent))
+            .map_err(|_| "audio host thread is gone".to_string())
+    }
+
+    pub fn set_click_volume(&self, volume: f32) -> Result<(), String> {
+        self.tx
+            .send(EngineCommand::SetClickVolume(volume))
+            .map_err(|_| "audio host thread is gone".to_string())
     }
 
     pub fn play(&self, path: PathBuf) -> Result<(), String> {
@@ -165,9 +299,33 @@ impl AudioEngine {
             .map_err(|_| "audio host thread is gone".to_string())
     }
 
+    pub fn play_cue(&self, path: PathBuf) -> Result<(), String> {
+        self.tx
+            .send(EngineCommand::PlayCue(path))
+            .map_err(|_| "audio host thread is gone".to_string())
+    }
+
+    pub fn stop_cue(&self) -> Result<(), String> {
+        self.tx
+            .send(EngineCommand::StopCue)
+            .map_err(|_| "audio host thread is gone".to_string())
+    }
+
+    pub fn set_duck_click(&self, duck: bool) -> Result<(), String> {
+        self.tx
+            .send(EngineCommand::SetDuckClick(duck))
+            .map_err(|_| "audio host thread is gone".to_string())
+    }
+
     pub fn set_volume(&self, volume: f32) -> Result<(), String> {
         self.tx
             .send(EngineCommand::SetVolume(volume.clamp(0.0, 1.0)))
+            .map_err(|_| "audio host thread is gone".to_string())
+    }
+
+    pub fn set_cue_volume(&self, volume: f32) -> Result<(), String> {
+        self.tx
+            .send(EngineCommand::SetCueVolume(volume.clamp(0.0, 1.0)))
             .map_err(|_| "audio host thread is gone".to_string())
     }
 
@@ -249,22 +407,133 @@ fn best_output_summary(device: &cpal::Device) -> Option<(usize, u32)> {
     Some((cfg.channels() as usize, cfg.sample_rate().0))
 }
 
-fn host_thread(rx: Receiver<EngineCommand>) {
+fn host_thread(
+    rx: Receiver<EngineCommand>,
+    events: crossbeam_channel::Sender<EngineEvent>,
+) {
     let mut active: Option<ActiveStream> = None;
     let mut master: f32 = 0.8;
+    let mut cue_volume: f32 = 1.0;
     let mut crossfade_ms: u32 = DEFAULT_CROSSFADE_MS;
+    // Last known device + channel layout, so SetClickChannels / SetCueChannels
+    // can re-issue build_stream with the right context.
+    let mut last_host: String = String::new();
+    let mut last_device: String = String::new();
+    let mut last_pad_channels: (usize, usize) = (0, 1);
+    let mut last_click_channels: (usize, usize) = (2, 3);
+    let mut last_cue_channels: (usize, usize) = (4, 5);
+    // Click state shadow — re-applied on every stream rebuild. `enabled` is
+    // deliberately not seeded from settings on boot (worship leaders shouldn't
+    // be surprised by a live click on launch); the desktop/remote toggle it on.
+    let mut click_enabled: bool = false;
+    let mut click_bpm: f32 = 90.0;
+    let mut click_beats: u32 = 4;
+    let mut click_accent: bool = true;
+    let mut click_volume: f32 = 0.8;
+    // Cue duck preference and the live "is a cue currently speaking" flag,
+    // tracked here so we can update the click ducking ramp when either changes.
+    let mut duck_click_pref: bool = false;
+    let mut cue_active: bool = false;
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
             EngineCommand::SetOutput {
                 host,
                 device,
-                channels,
+                pad_channels,
+                click_channels,
+                cue_channels,
                 reply,
             } => {
-                let result = build_stream(&host, &device, channels, master);
-                match result {
+                let click_init = ClickInit {
+                    enabled: click_enabled,
+                    bpm: click_bpm,
+                    beats_per_bar: click_beats,
+                    accent: click_accent,
+                    volume: click_volume,
+                };
+                match build_stream(
+                    &host,
+                    &device,
+                    pad_channels,
+                    click_channels,
+                    cue_channels,
+                    master,
+                    cue_volume,
+                    click_init,
+                ) {
                     Ok(stream) => {
+                        last_host = host;
+                        last_device = device;
+                        last_pad_channels = pad_channels;
+                        last_click_channels = click_channels;
+                        last_cue_channels = cue_channels;
+                        active = Some(stream);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(e) => {
+                        active = None;
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            EngineCommand::SetClickChannels { channels, reply } => {
+                if last_device.is_empty() {
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
+                let click_init = ClickInit {
+                    enabled: click_enabled,
+                    bpm: click_bpm,
+                    beats_per_bar: click_beats,
+                    accent: click_accent,
+                    volume: click_volume,
+                };
+                match build_stream(
+                    &last_host,
+                    &last_device,
+                    last_pad_channels,
+                    channels,
+                    last_cue_channels,
+                    master,
+                    cue_volume,
+                    click_init,
+                ) {
+                    Ok(stream) => {
+                        last_click_channels = channels;
+                        active = Some(stream);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(e) => {
+                        active = None;
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            EngineCommand::SetCueChannels { channels, reply } => {
+                if last_device.is_empty() {
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
+                let click_init = ClickInit {
+                    enabled: click_enabled,
+                    bpm: click_bpm,
+                    beats_per_bar: click_beats,
+                    accent: click_accent,
+                    volume: click_volume,
+                };
+                match build_stream(
+                    &last_host,
+                    &last_device,
+                    last_pad_channels,
+                    last_click_channels,
+                    channels,
+                    master,
+                    cue_volume,
+                    click_init,
+                ) {
+                    Ok(stream) => {
+                        last_cue_channels = channels;
                         active = Some(stream);
                         let _ = reply.send(Ok(()));
                     }
@@ -276,10 +545,12 @@ fn host_thread(rx: Receiver<EngineCommand>) {
             }
             EngineCommand::Play(path) => {
                 if let Some(act) = active.as_mut() {
-                    let dec = decode::spawn(path, act.out_rate);
+                    let dec = decode::spawn(path, act.out_rate, true);
                     let voice = Voice {
                         consumer: dec.consumer,
                         stop: dec.stop,
+                        ended: dec.ended,
+                        bus: VoiceBus::Pad,
                         gain: 0.0,
                         target: 1.0,
                         step: fade_step(crossfade_ms, act.out_rate),
@@ -296,14 +567,109 @@ fn host_thread(rx: Receiver<EngineCommand>) {
                     let _ = act.cmd_tx.push(PlayCommand::FadeOutAll(step));
                 }
             }
+            EngineCommand::PlayCue(path) => {
+                let Some(act) = active.as_mut() else {
+                    eprintln!("[audio] PlayCue ignored: no output device configured");
+                    continue;
+                };
+                let dec = decode::spawn(path, act.out_rate, false);
+                let voice = Voice {
+                    consumer: dec.consumer,
+                    stop: dec.stop,
+                    ended: dec.ended.clone(),
+                    bus: VoiceBus::Cue,
+                    gain: 1.0,
+                    target: 1.0,
+                    // Short fade-in/out so cue start/stop never click. Not a
+                    // pad-style crossfade — voice is a one-shot.
+                    step: fade_step(50, act.out_rate),
+                    remove_when_silent: false,
+                };
+                let _ = act.cmd_tx.push(PlayCommand::PushCue(voice));
+                cue_active = true;
+                let _ = events.send(EngineEvent::CueStarted);
+                if duck_click_pref {
+                    let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(true));
+                }
+                // Watcher: when the decoder signals "ended", give the audio
+                // buffer ~300 ms to drain, then notify upstream so NowPlaying
+                // can flip `speaking` back to false.
+                let watcher_events = events.clone();
+                let watcher_ended = dec.ended;
+                std::thread::Builder::new()
+                    .name("cue-watcher".into())
+                    .spawn(move || {
+                        while !watcher_ended.load(Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        let _ = watcher_events.send(EngineEvent::CueEnded);
+                    })
+                    .ok();
+            }
+            EngineCommand::StopCue => {
+                if let Some(act) = active.as_mut() {
+                    let step = fade_step(50, act.out_rate);
+                    let _ = act.cmd_tx.push(PlayCommand::StopCue(step));
+                    if cue_active {
+                        cue_active = false;
+                        let _ = events.send(EngineEvent::CueEnded);
+                    }
+                    if duck_click_pref {
+                        let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(false));
+                    }
+                }
+            }
             EngineCommand::SetVolume(v) => {
                 master = v;
                 if let Some(act) = active.as_mut() {
                     let _ = act.cmd_tx.push(PlayCommand::SetMaster(v));
                 }
             }
+            EngineCommand::SetCueVolume(v) => {
+                cue_volume = v;
+                if let Some(act) = active.as_mut() {
+                    let _ = act.cmd_tx.push(PlayCommand::SetCueVolume(v));
+                }
+            }
             EngineCommand::SetCrossfade(ms) => {
                 crossfade_ms = ms.max(1);
+            }
+            EngineCommand::SetClickEnabled(en) => {
+                click_enabled = en;
+                if let Some(act) = active.as_mut() {
+                    let _ = act.cmd_tx.push(PlayCommand::SetClickEnabled(en));
+                }
+            }
+            EngineCommand::SetClickBpm(bpm) => {
+                click_bpm = bpm;
+                if let Some(act) = active.as_mut() {
+                    let _ = act.cmd_tx.push(PlayCommand::SetClickBpm(bpm));
+                }
+            }
+            EngineCommand::SetClickBeats(b) => {
+                click_beats = b;
+                if let Some(act) = active.as_mut() {
+                    let _ = act.cmd_tx.push(PlayCommand::SetClickBeats(b));
+                }
+            }
+            EngineCommand::SetClickAccent(a) => {
+                click_accent = a;
+                if let Some(act) = active.as_mut() {
+                    let _ = act.cmd_tx.push(PlayCommand::SetClickAccent(a));
+                }
+            }
+            EngineCommand::SetClickVolume(v) => {
+                click_volume = v;
+                if let Some(act) = active.as_mut() {
+                    let _ = act.cmd_tx.push(PlayCommand::SetClickVolume(v));
+                }
+            }
+            EngineCommand::SetDuckClick(pref) => {
+                duck_click_pref = pref;
+                if let Some(act) = active.as_mut() {
+                    let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(pref && cue_active));
+                }
             }
         }
     }
@@ -352,11 +718,34 @@ fn pick_supported(
     }
 }
 
+/// A stereo bus's routing: physical channel indexes on the output device.
+/// `l == r` means mono (mix sums to -6 dB; see `write_pair`).
+#[derive(Clone, Copy, Debug)]
+struct BusRouting {
+    /// `None` when the configured channel is out of range for the device —
+    /// degrades silently rather than rejecting the switch.
+    l: Option<usize>,
+    r: Option<usize>,
+}
+
+impl BusRouting {
+    fn new(l: usize, r: usize, total_channels: usize) -> Self {
+        BusRouting {
+            l: (l < total_channels).then_some(l),
+            r: (r < total_channels).then_some(r),
+        }
+    }
+}
+
 fn build_stream(
     host_label: &str,
     device_name: &str,
-    channels: (usize, usize),
+    pad_channels: (usize, usize),
+    click_channels: (usize, usize),
+    cue_channels: (usize, usize),
     master: f32,
+    cue_volume: f32,
+    click_init: ClickInit,
 ) -> Result<ActiveStream, String> {
     let host = host_from_label(host_label)?;
     let device = host
@@ -370,13 +759,26 @@ fn build_stream(
     let config: cpal::StreamConfig = supported.config();
     let total_channels = config.channels as usize;
     let out_rate = config.sample_rate.0;
-    let (ch_l, ch_r) = channels;
+    let (pad_l, pad_r) = pad_channels;
+    let (click_l, click_r) = click_channels;
+    let (cue_l, cue_r) = cue_channels;
 
-    if ch_l >= total_channels || ch_r >= total_channels {
+    if pad_l >= total_channels || pad_r >= total_channels {
         return Err(format!(
-            "channel pair ({ch_l},{ch_r}) out of range; device has {total_channels} channels"
+            "pad channel pair ({pad_l},{pad_r}) out of range; device has {total_channels} channels"
         ));
     }
+    // Click and cue channels are allowed to be out of range — the callback
+    // simply doesn't write to them. Lets us silently degrade when switching
+    // to a 2-channel device without rejecting the device switch entirely.
+    let pad_bus = BusRouting {
+        l: Some(pad_l),
+        r: Some(pad_r),
+    };
+    let click_bus = BusRouting::new(click_l, click_r, total_channels);
+    let cue_bus = BusRouting::new(cue_l, cue_r, total_channels);
+
+    let click_gen = ClickGen::new(out_rate, click_init);
 
     // Lock-free queue: host thread → real-time callback.
     let (cmd_tx, cmd_rx) = RingBuffer::<PlayCommand>::new(64);
@@ -384,13 +786,31 @@ fn build_stream(
     let err_fn = |err| eprintln!("[audio] stream error: {err}");
     let stream = match sample_format {
         SampleFormat::F32 => {
-            let cb = build_callback_f32(total_channels, ch_l, ch_r, master, cmd_rx);
+            let cb = build_callback_f32(
+                total_channels,
+                pad_bus,
+                click_bus,
+                cue_bus,
+                master,
+                cue_volume,
+                click_gen,
+                cmd_rx,
+            );
             device
                 .build_output_stream(&config, cb, err_fn, None)
                 .map_err(|e| format!("build output stream (f32): {e}"))?
         }
         SampleFormat::I32 => {
-            let cb = build_callback_i32(total_channels, ch_l, ch_r, master, cmd_rx);
+            let cb = build_callback_i32(
+                total_channels,
+                pad_bus,
+                click_bus,
+                cue_bus,
+                master,
+                cue_volume,
+                click_gen,
+                cmd_rx,
+            );
             device
                 .build_output_stream(&config, cb, err_fn, None)
                 .map_err(|e| format!("build output stream (i32): {e}"))?
@@ -409,12 +829,169 @@ fn build_stream(
     })
 }
 
-/// Pull one f32 stereo frame from the active voices, mixing into (mix_l, mix_r),
-/// and advance per-voice gain ramps. Shared by the f32 and i32 callbacks.
+/// Synthesized click. Lives entirely inside the real-time callback: no
+/// allocation, no I/O, just integer counters and a windowed sine ping per beat.
+/// A 20 ms equal-rate ramp on enable/disable keeps toggling click-free.
+struct ClickGen {
+    sample_rate: f32,
+    bpm: f32,
+    beats_per_bar: u32,
+    accent: bool,
+    volume: f32,
+    samples_per_beat: f32,
+    samples_since_beat: f32,
+    beat_index: u32,
+    // Active ping voice (one at a time — at 300 BPM the prior ping is long gone
+    // before the next one fires).
+    osc_phase: f32,    // radians, wraps at 2π
+    osc_freq: f32,     // Hz
+    osc_env: f32,      // current envelope, decays per sample
+    osc_decay: f32,    // per-sample env multiplier
+    // Enable ramp: ~20 ms equal-rate fade in/out to suppress click-on-toggle.
+    enable_ramp: f32,
+    enable_target: f32,
+    enable_step: f32,
+    // Cue-duck ramp: drops the click by ~12 dB while a cue is speaking so the
+    // voice cuts through. Independent of `enable_ramp` and `volume` so the
+    // user's click volume isn't disturbed.
+    duck_ramp: f32,
+    duck_target: f32,
+    duck_step: f32,
+}
+
+/// Linear multiplier corresponding to a -12 dB drop (≈0.25). Hardcoded — the
+/// duck amount isn't surfaced to the UI yet; the user only toggles whether
+/// ducking happens at all.
+const CUE_DUCK_GAIN: f32 = 0.251_188_64;
+
+impl ClickGen {
+    fn new(sample_rate: u32, init: ClickInit) -> Self {
+        let sr = sample_rate as f32;
+        let bpm = init.bpm.clamp(20.0, 400.0);
+        let beats = init.beats_per_bar.clamp(1, 32);
+        let enable_target = if init.enabled { 1.0 } else { 0.0 };
+        ClickGen {
+            sample_rate: sr,
+            bpm,
+            beats_per_bar: beats,
+            accent: init.accent,
+            volume: init.volume.clamp(0.0, 1.0),
+            samples_per_beat: 60.0 / bpm * sr,
+            // Re-arm so the first beat fires immediately on enable.
+            samples_since_beat: 60.0 / bpm * sr,
+            beat_index: 0,
+            osc_phase: 0.0,
+            osc_freq: 1500.0,
+            osc_env: 0.0,
+            osc_decay: env_decay_per_sample(sr),
+            enable_ramp: enable_target,
+            enable_target,
+            enable_step: 1.0 / (0.020 * sr).max(1.0),
+            duck_ramp: 1.0,
+            duck_target: 1.0,
+            // ~60 ms ducking ramp — fast enough to dip before the cue's first
+            // syllable, slow enough not to thump on enable.
+            duck_step: (1.0 - CUE_DUCK_GAIN) / (0.060 * sr).max(1.0),
+        }
+    }
+
+    fn set_bpm(&mut self, bpm: f32) {
+        self.bpm = bpm.clamp(20.0, 400.0);
+        self.samples_per_beat = 60.0 / self.bpm * self.sample_rate;
+    }
+    fn set_beats(&mut self, b: u32) {
+        self.beats_per_bar = b.clamp(1, 32);
+        if self.beat_index >= self.beats_per_bar {
+            self.beat_index = 0;
+        }
+    }
+    fn set_accent(&mut self, a: bool) {
+        self.accent = a;
+    }
+    fn set_volume(&mut self, v: f32) {
+        self.volume = v.clamp(0.0, 1.0);
+    }
+    fn set_enabled(&mut self, en: bool) {
+        self.enable_target = if en { 1.0 } else { 0.0 };
+        if en {
+            // Re-arm beat 1 to fire immediately so the user hears the click
+            // start the moment they press play.
+            self.beat_index = 0;
+            self.samples_since_beat = self.samples_per_beat;
+            self.osc_env = 0.0;
+        }
+    }
+    fn set_duck_active(&mut self, active: bool) {
+        self.duck_target = if active { CUE_DUCK_GAIN } else { 1.0 };
+    }
+
+    #[inline]
+    fn next_sample(&mut self) -> f32 {
+        if self.enable_ramp < self.enable_target {
+            self.enable_ramp = (self.enable_ramp + self.enable_step).min(self.enable_target);
+        } else if self.enable_ramp > self.enable_target {
+            self.enable_ramp = (self.enable_ramp - self.enable_step).max(self.enable_target);
+        }
+        if self.duck_ramp < self.duck_target {
+            self.duck_ramp = (self.duck_ramp + self.duck_step).min(self.duck_target);
+        } else if self.duck_ramp > self.duck_target {
+            self.duck_ramp = (self.duck_ramp - self.duck_step).max(self.duck_target);
+        }
+
+        // Fully off: skip the oscillator math entirely.
+        if self.enable_ramp <= 0.0 && self.enable_target <= 0.0 {
+            return 0.0;
+        }
+
+        if self.samples_since_beat >= self.samples_per_beat {
+            self.samples_since_beat -= self.samples_per_beat;
+            let is_one = self.beat_index == 0 && self.accent;
+            self.osc_freq = if is_one { 2000.0 } else { 1500.0 };
+            self.osc_phase = 0.0;
+            self.osc_env = if is_one { 1.0 } else { 0.7 };
+            self.beat_index = (self.beat_index + 1) % self.beats_per_bar.max(1);
+        }
+
+        let s = self.osc_phase.sin()
+            * self.osc_env
+            * self.volume
+            * self.enable_ramp
+            * self.duck_ramp;
+        self.osc_phase += std::f32::consts::TAU * self.osc_freq / self.sample_rate;
+        if self.osc_phase >= std::f32::consts::TAU {
+            self.osc_phase -= std::f32::consts::TAU;
+        }
+        self.osc_env *= self.osc_decay;
+        self.samples_since_beat += 1.0;
+
+        s
+    }
+}
+
+/// Per-sample envelope multiplier so a fresh ping decays from 1.0 to ~0.001
+/// over 30 ms. Independent of BPM (the envelope IS the click).
+fn env_decay_per_sample(sample_rate: f32) -> f32 {
+    let frames = (sample_rate * 0.030).max(1.0);
+    0.001_f32.powf(1.0 / frames)
+}
+
+/// One frame of mixed audio, separated by bus so the writer can route each to
+/// its own channel pair.
+#[derive(Default, Clone, Copy)]
+struct MixedFrame {
+    pad_l: f32,
+    pad_r: f32,
+    cue_l: f32,
+    cue_r: f32,
+}
+
+/// Pull one f32 stereo frame from the active voices, splitting pad voices from
+/// cue voices and applying master volume only to pads. Cues are louder by
+/// default (set in CueSettings::volume on the host side), and we don't want
+/// the pad's master volume to also attenuate the spoken voice.
 #[inline]
-fn mix_one_frame(voices: &mut Vec<Voice>, master: f32) -> (f32, f32) {
-    let mut mix_l = 0.0f32;
-    let mut mix_r = 0.0f32;
+fn mix_one_frame(voices: &mut Vec<Voice>, master: f32, cue_volume: f32) -> MixedFrame {
+    let mut m = MixedFrame::default();
 
     for v in voices.iter_mut() {
         if v.gain < v.target {
@@ -426,95 +1003,221 @@ fn mix_one_frame(voices: &mut Vec<Voice>, master: f32) -> (f32, f32) {
         if v.consumer.slots() >= 2 {
             let l = v.consumer.pop().unwrap_or(0.0);
             let r = v.consumer.pop().unwrap_or(0.0);
-            mix_l += l * v.gain;
-            mix_r += r * v.gain;
+            match v.bus {
+                VoiceBus::Pad => {
+                    m.pad_l += l * v.gain;
+                    m.pad_r += r * v.gain;
+                }
+                VoiceBus::Cue => {
+                    m.cue_l += l * v.gain;
+                    m.cue_r += r * v.gain;
+                }
+            }
+        } else if v.bus == VoiceBus::Cue && v.ended.load(Ordering::Relaxed) {
+            // Decoder is done and the ring is empty — start a quick fade so
+            // the voice drops out without a perceptible cut.
+            v.target = 0.0;
+            v.remove_when_silent = true;
         }
     }
 
     voices.retain(|v| !(v.remove_when_silent && v.gain <= 0.0));
 
-    (mix_l * master, mix_r * master)
+    m.pad_l *= master;
+    m.pad_r *= master;
+    m.cue_l *= cue_volume;
+    m.cue_r *= cue_volume;
+    m
 }
 
 #[inline]
-fn drain_commands(voices: &mut Vec<Voice>, master: &mut f32, cmd_rx: &mut rtrb::Consumer<PlayCommand>) {
+fn drain_commands(
+    voices: &mut Vec<Voice>,
+    master: &mut f32,
+    cue_volume: &mut f32,
+    click: &mut ClickGen,
+    cmd_rx: &mut rtrb::Consumer<PlayCommand>,
+) {
     while let Ok(cmd) = cmd_rx.pop() {
         match cmd {
             PlayCommand::Crossfade(v) => {
                 for old in voices.iter_mut() {
-                    old.target = 0.0;
-                    old.remove_when_silent = true;
+                    if old.bus == VoiceBus::Pad {
+                        old.target = 0.0;
+                        old.remove_when_silent = true;
+                    }
+                }
+                voices.push(v);
+            }
+            PlayCommand::PushCue(v) => {
+                // Replace any in-flight cue immediately — last press wins; the
+                // band shouldn't have to wait through "Verse 2" before "Bridge"
+                // can speak. Old cue's decoder thread will exit (Voice::Drop
+                // flips stop).
+                for old in voices.iter_mut() {
+                    if old.bus == VoiceBus::Cue {
+                        old.target = 0.0;
+                        old.remove_when_silent = true;
+                    }
                 }
                 voices.push(v);
             }
             PlayCommand::FadeOutAll(step) => {
                 for v in voices.iter_mut() {
-                    v.target = 0.0;
-                    v.step = step;
-                    v.remove_when_silent = true;
+                    if v.bus == VoiceBus::Pad {
+                        v.target = 0.0;
+                        v.step = step;
+                        v.remove_when_silent = true;
+                    }
+                }
+            }
+            PlayCommand::StopCue(step) => {
+                for v in voices.iter_mut() {
+                    if v.bus == VoiceBus::Cue {
+                        v.target = 0.0;
+                        v.step = step;
+                        v.remove_when_silent = true;
+                    }
                 }
             }
             PlayCommand::SetMaster(m) => *master = m,
+            PlayCommand::SetCueVolume(v) => *cue_volume = v,
+            PlayCommand::SetClickEnabled(en) => click.set_enabled(en),
+            PlayCommand::SetClickBpm(bpm) => click.set_bpm(bpm),
+            PlayCommand::SetClickBeats(b) => click.set_beats(b),
+            PlayCommand::SetClickAccent(a) => click.set_accent(a),
+            PlayCommand::SetClickVolume(v) => click.set_volume(v),
+            PlayCommand::SetClickDuckActive(active) => click.set_duck_active(active),
         }
     }
 }
 
+/// Sum one stereo bus into the given channel slots of `frame`.
+///   - Both indexes present and equal → user picked mono; sum at -6 dB so
+///     correlated material doesn't clip.
+///   - Both indexes present and different → route stereo as-is.
+///   - One present → mono input; write to whichever exists. Cues are also
+///     reasonably "mono" (SAPI renders single-channel WAVs) so duplicating
+///     the same sample into both channels of a stereo cue pair is the
+///     correct behavior — handled by the caller passing l == r samples.
+///   - Neither present → silently dropped (e.g. configured channels are out
+///     of range for the current device).
+///
+/// Channel collisions across buses (cue and click on the same channel, say)
+/// sum naturally because we always `+=`.
+#[inline]
+fn write_pair(frame: &mut [f32], bus: BusRouting, l: f32, r: f32) {
+    match (bus.l, bus.r) {
+        (Some(li), Some(ri)) if li == ri => {
+            if li < frame.len() {
+                frame[li] += 0.5 * (l + r);
+            }
+        }
+        (Some(li), Some(ri)) => {
+            if li < frame.len() {
+                frame[li] += l;
+            }
+            if ri < frame.len() {
+                frame[ri] += r;
+            }
+        }
+        (Some(i), None) | (None, Some(i)) => {
+            if i < frame.len() {
+                frame[i] += 0.5 * (l + r);
+            }
+        }
+        (None, None) => {}
+    }
+}
+
+/// Write pad + click + cue into the right slots of `frame`. Click is mono;
+/// it's expanded by passing the same sample as l/r.
+#[inline]
+fn write_frame_f32(
+    frame: &mut [f32],
+    pad_bus: BusRouting,
+    click_bus: BusRouting,
+    cue_bus: BusRouting,
+    pad_l: f32,
+    pad_r: f32,
+    cue_l: f32,
+    cue_r: f32,
+    click: f32,
+) {
+    for sample in frame.iter_mut() {
+        *sample = 0.0;
+    }
+    write_pair(frame, pad_bus, pad_l, pad_r);
+    write_pair(frame, click_bus, click, click);
+    write_pair(frame, cue_bus, cue_l, cue_r);
+}
+
 fn build_callback_f32(
     total_channels: usize,
-    ch_l: usize,
-    ch_r: usize,
+    pad_bus: BusRouting,
+    click_bus: BusRouting,
+    cue_bus: BusRouting,
     master_init: f32,
+    cue_volume_init: f32,
+    click_init: ClickGen,
     mut cmd_rx: rtrb::Consumer<PlayCommand>,
 ) -> impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut voices: Vec<Voice> = Vec::with_capacity(4);
     let mut master = master_init;
+    let mut cue_volume = cue_volume_init;
+    let mut click = click_init;
 
     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-        drain_commands(&mut voices, &mut master, &mut cmd_rx);
+        drain_commands(&mut voices, &mut master, &mut cue_volume, &mut click, &mut cmd_rx);
 
         for frame in data.chunks_mut(total_channels) {
-            let (l, r) = mix_one_frame(&mut voices, master);
-            for (i, sample) in frame.iter_mut().enumerate() {
-                *sample = if i == ch_l {
-                    l
-                } else if i == ch_r {
-                    r
-                } else {
-                    0.0
-                };
-            }
+            let m = mix_one_frame(&mut voices, master, cue_volume);
+            let c = click.next_sample();
+            write_frame_f32(
+                frame, pad_bus, click_bus, cue_bus, m.pad_l, m.pad_r, m.cue_l, m.cue_r, c,
+            );
         }
     }
 }
 
 fn build_callback_i32(
     total_channels: usize,
-    ch_l: usize,
-    ch_r: usize,
+    pad_bus: BusRouting,
+    click_bus: BusRouting,
+    cue_bus: BusRouting,
     master_init: f32,
+    cue_volume_init: f32,
+    click_init: ClickGen,
     mut cmd_rx: rtrb::Consumer<PlayCommand>,
 ) -> impl FnMut(&mut [i32], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut voices: Vec<Voice> = Vec::with_capacity(4);
     let mut master = master_init;
+    let mut cue_volume = cue_volume_init;
+    let mut click = click_init;
 
     // i32 full-scale. Headroom of 1 sample on the negative side avoids wrap.
     const SCALE: f32 = 2_147_483_520.0;
 
+    // Scratch buffer reused per frame so we can compose the f32 sum and then
+    // convert; sized for the worst-case channel count we'll ever see.
+    let mut scratch = [0.0f32; 64];
+
     move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
-        drain_commands(&mut voices, &mut master, &mut cmd_rx);
+        drain_commands(&mut voices, &mut master, &mut cue_volume, &mut click, &mut cmd_rx);
 
         for frame in data.chunks_mut(total_channels) {
-            let (l, r) = mix_one_frame(&mut voices, master);
-            for (i, sample) in frame.iter_mut().enumerate() {
-                let v = if i == ch_l {
-                    l
-                } else if i == ch_r {
-                    r
-                } else {
-                    0.0
-                };
+            let m = mix_one_frame(&mut voices, master, cue_volume);
+            let c = click.next_sample();
+
+            let n = frame.len().min(scratch.len());
+            let scratch = &mut scratch[..n];
+            write_frame_f32(
+                scratch, pad_bus, click_bus, cue_bus, m.pad_l, m.pad_r, m.cue_l, m.cue_r, c,
+            );
+
+            for (out, v) in frame.iter_mut().zip(scratch.iter()) {
                 let clipped = v.clamp(-1.0, 1.0);
-                *sample = (clipped * SCALE) as i32;
+                *out = (clipped * SCALE) as i32;
             }
         }
     }

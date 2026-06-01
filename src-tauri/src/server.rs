@@ -20,7 +20,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tower_http::cors::CorsLayer;
 
 use crate::audio::AudioEngine;
-use crate::commands;
+use crate::commands::{self, CueSynth};
 use crate::state::CoreState;
 
 const REMOTE_HTML: &str = include_str!("../assets/remote.html");
@@ -56,6 +56,14 @@ pub async fn serve(app: AppHandle, port: u16) {
         .route("/api/stop", post(stop))
         .route("/api/volume", post(volume))
         .route("/api/preset/:id", post(preset))
+        .route("/api/click/enabled", post(click_enabled))
+        .route("/api/click/bpm", post(click_bpm))
+        .route("/api/click/beats", post(click_beats))
+        .route("/api/click/accent", post(click_accent))
+        .route("/api/click/volume", post(click_volume))
+        .route("/api/cue/speak", post(cue_speak))
+        .route("/api/cue/quick/:id", post(cue_quick))
+        .route("/api/cue/stop", post(cue_stop))
         .route("/ws", get(ws_upgrade))
         .layer(CorsLayer::permissive())
         .with_state(app);
@@ -90,7 +98,7 @@ fn advertise_mdns(port: u16) {
 
     match ServiceInfo::new(
         "_http._tcp.local.",
-        "Worship Pads",
+        "StagePal",
         &host_name,
         ip.as_str(),
         port,
@@ -130,7 +138,14 @@ async fn state_handler(State(app): State<AppHandle>) -> impl IntoResponse {
 async fn play(State(app): State<AppHandle>, Path(key): Path<String>) -> Response {
     let core = app.state::<CoreState>();
     let engine = app.state::<AudioEngine>();
-    map_result(commands::play_key_logic(&app, core.inner(), engine.inner(), &key))
+    let synth = app.state::<CueSynth>();
+    map_result(commands::play_key_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        synth.0.as_ref(),
+        &key,
+    ))
 }
 
 async fn stop(State(app): State<AppHandle>) -> Response {
@@ -159,6 +174,107 @@ async fn preset(State(app): State<AppHandle>, Path(id): Path<String>) -> Respons
     let core = app.state::<CoreState>();
     let engine = app.state::<AudioEngine>();
     map_result(commands::set_preset_logic(&app, core.inner(), engine.inner(), &id))
+}
+
+#[derive(Deserialize)]
+struct EnabledBody { enabled: bool }
+#[derive(Deserialize)]
+struct BpmBody { bpm: f32 }
+#[derive(Deserialize)]
+struct BeatsBody { beats: u32 }
+#[derive(Deserialize)]
+struct AccentBody { accent: bool }
+
+async fn click_enabled(State(app): State<AppHandle>, Json(body): Json<EnabledBody>) -> Response {
+    let core = app.state::<CoreState>();
+    let engine = app.state::<AudioEngine>();
+    map_result(commands::set_click_enabled_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        body.enabled,
+    ))
+}
+
+async fn click_bpm(State(app): State<AppHandle>, Json(body): Json<BpmBody>) -> Response {
+    let core = app.state::<CoreState>();
+    let engine = app.state::<AudioEngine>();
+    map_result(commands::set_click_bpm_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        body.bpm,
+    ))
+}
+
+async fn click_beats(State(app): State<AppHandle>, Json(body): Json<BeatsBody>) -> Response {
+    let core = app.state::<CoreState>();
+    let engine = app.state::<AudioEngine>();
+    map_result(commands::set_click_beats_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        body.beats,
+    ))
+}
+
+async fn click_accent(State(app): State<AppHandle>, Json(body): Json<AccentBody>) -> Response {
+    let core = app.state::<CoreState>();
+    let engine = app.state::<AudioEngine>();
+    map_result(commands::set_click_accent_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        body.accent,
+    ))
+}
+
+async fn click_volume(State(app): State<AppHandle>, Json(body): Json<VolumeBody>) -> Response {
+    let core = app.state::<CoreState>();
+    let engine = app.state::<AudioEngine>();
+    map_result(commands::set_click_volume_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        body.volume,
+    ))
+}
+
+#[derive(Deserialize)]
+struct SpeakBody { text: String }
+
+async fn cue_speak(State(app): State<AppHandle>, Json(body): Json<SpeakBody>) -> Response {
+    let core = app.state::<CoreState>();
+    let engine = app.state::<AudioEngine>();
+    let synth = app.state::<CueSynth>();
+    map_result(commands::cue_speak_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        synth.0.as_ref(),
+        &body.text,
+        None,
+        None,
+    ))
+}
+
+async fn cue_quick(State(app): State<AppHandle>, Path(id): Path<String>) -> Response {
+    let core = app.state::<CoreState>();
+    let engine = app.state::<AudioEngine>();
+    let synth = app.state::<CueSynth>();
+    map_result(commands::cue_speak_quick_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        synth.0.as_ref(),
+        &id,
+    ))
+}
+
+async fn cue_stop(State(app): State<AppHandle>) -> Response {
+    let core = app.state::<CoreState>();
+    let engine = app.state::<AudioEngine>();
+    map_result(commands::cue_stop_logic(&app, core.inner(), engine.inner()))
 }
 
 async fn ws_upgrade(State(app): State<AppHandle>, ws: WebSocketUpgrade) -> Response {
