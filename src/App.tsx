@@ -4,6 +4,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  getActiveOutput,
   getServerUrl,
   getSettings,
   getState,
@@ -11,6 +12,7 @@ import {
   onNowPlaying,
   scanLibrary,
   setClickEnabled,
+  type ActiveOutput,
   type DeviceInfo,
   type NowPlaying,
   type ServerUrl,
@@ -33,9 +35,17 @@ const PAGE_KEY = "stagepal.page";
 type Page = "pads" | "click" | "cues" | "library" | "settings";
 const PAGES: Page[] = ["pads", "click", "cues", "library", "settings"];
 
+// Phone-remote address: prefer the raw LAN IP, fall back to the mDNS .local name.
+function phoneAddress(server: ServerUrl | null): { url: string; addr: string } {
+  if (!server) return { url: "", addr: "" };
+  const addr = `${server.ip || `${server.host}.local`}:${server.port}`;
+  return { url: `http://${addr}`, addr };
+}
+
 function App() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
+  const [activeOutput, setActiveOutput] = useState<ActiveOutput | null>(null);
   const [now, setNow] = useState<NowPlaying | null>(null);
   const [server, setServer] = useState<ServerUrl | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -59,6 +69,9 @@ function App() {
 
   async function refreshSettings() {
     setSettings(await getSettings());
+    // The opened stream may have changed (device switch / channel edit). Pull
+    // the live output so the routing pickers size to the real channel count.
+    setActiveOutput(await getActiveOutput().catch(() => null));
   }
 
   useEffect(() => {
@@ -68,6 +81,7 @@ function App() {
         setSettings(await getSettings());
         setNow(await getState());
         setServer(await getServerUrl());
+        setActiveOutput(await getActiveOutput().catch(() => null));
       } catch (e) {
         setError(String(e));
       }
@@ -114,7 +128,15 @@ function App() {
   const selectedDevice = devices.find(
     (d) => d.name === settings?.output_device && d.host === settings?.output_host,
   );
-  const channelCount = selectedDevice?.channels ?? 2;
+  // Prefer the live opened channel count — it's what the device actually gave
+  // us — falling back to the enumerated count, then a stereo default.
+  const liveOutput =
+    activeOutput &&
+    activeOutput.device === settings?.output_device &&
+    activeOutput.host === settings?.output_host
+      ? activeOutput
+      : null;
+  const channelCount = liveOutput?.channels ?? selectedDevice?.channels ?? 2;
 
   async function guard(fn: () => Promise<unknown>) {
     try {
@@ -135,16 +157,7 @@ function App() {
     }
   }
 
-  const phoneUrl = server
-    ? server.ip
-      ? `http://${server.ip}:${server.port}`
-      : `http://${server.host}.local:${server.port}`
-    : "";
-  const phoneAddr = server
-    ? server.ip
-      ? `${server.ip}:${server.port}`
-      : `${server.host}.local:${server.port}`
-    : "";
+  const { url: phoneUrl, addr: phoneAddr } = phoneAddress(server);
 
   if (!settings) {
     return (
@@ -217,6 +230,7 @@ function App() {
               settings={settings}
               devices={devices}
               channelCount={channelCount}
+              activeOutput={liveOutput}
               guard={guard}
               refreshSettings={refreshSettings}
             />

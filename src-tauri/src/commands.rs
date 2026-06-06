@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
-use crate::audio::{AudioEngine, DeviceInfo};
+use crate::audio::{ActiveOutput, AudioEngine, DeviceInfo};
 use crate::cues::{self, Synthesizer, VoiceInfo};
 use crate::library;
 use crate::model::{now_unix_ms, Key, NowPlaying, Preset, QuickCue, Settings};
@@ -286,6 +286,35 @@ pub fn get_state(core: State<'_, CoreState>) -> NowPlaying {
 #[tauri::command]
 pub fn list_audio_devices() -> Vec<DeviceInfo> {
     AudioEngine::list_devices()
+}
+
+/// What the engine has actually got open right now (device, real channel count,
+/// sample rate, format, buffer size). The Settings UI shows this so the user can
+/// confirm a device truly opened — and the routing pickers can size themselves
+/// to the live channel count rather than a probe that might disagree.
+#[tauri::command]
+pub fn get_active_output(engine: State<'_, AudioEngine>) -> Option<ActiveOutput> {
+    engine.active_output()
+}
+
+/// Run a full audio probe across every host/device and return it as text. Also
+/// written to the log file. This is the report to capture when a device won't
+/// open on a machine we can't reach.
+#[tauri::command]
+pub fn audio_diagnostics() -> String {
+    AudioEngine::diagnostics()
+}
+
+/// Absolute path of the diagnostic log file, so the UI can offer "open folder".
+#[tauri::command]
+pub fn get_log_path() -> Option<String> {
+    crate::logging::log_path().map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Tail of the log file (last ~64 KB) for the in-app viewer.
+#[tauri::command]
+pub fn read_log() -> String {
+    crate::logging::read_tail(64 * 1024)
 }
 
 #[tauri::command]

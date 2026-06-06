@@ -31,6 +31,18 @@ export interface DeviceInfo {
   is_default: boolean;
 }
 
+/** The stream the engine currently has open. Null when nothing is open. */
+export interface ActiveOutput {
+  host: string;
+  device: string;
+  channels: number;
+  sample_rate: number;
+  /** "f32" or "i32" — which sample path is feeding the device. */
+  sample_format: string;
+  /** Negotiated callback buffer size in frames; null until audio flows. */
+  buffer_frames: number | null;
+}
+
 export interface Preset {
   id: string;
   name: string;
@@ -91,6 +103,19 @@ export interface ServerUrl {
 export const getSettings = () => invoke<Settings>("get_settings");
 export const getState = () => invoke<NowPlaying>("get_state");
 export const listAudioDevices = () => invoke<DeviceInfo[]>("list_audio_devices");
+
+/** What the engine has open right now (device, real channel count, rate, …). */
+export const getActiveOutput = () =>
+  invoke<ActiveOutput | null>("get_active_output");
+
+/** Full audio probe across every host/device, as text (also written to log). */
+export const audioDiagnostics = () => invoke<string>("audio_diagnostics");
+
+/** Absolute path of the diagnostic log file, or null if logging is off. */
+export const getLogPath = () => invoke<string | null>("get_log_path");
+
+/** Tail (~64 KB) of the diagnostic log. */
+export const readLog = () => invoke<string>("read_log");
 
 export const setAudioOutput = (
   host: string,

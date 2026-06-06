@@ -12,8 +12,8 @@
 //!     never locks, allocates, or touches the filesystem.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -60,6 +60,22 @@ pub struct DeviceInfo {
     pub default_sample_rate: u32,
     /// True if this is the default output device on the default host.
     pub is_default: bool,
+}
+
+/// Describes the stream that is actually open right now — surfaced to the UI so
+/// the Settings page can show "ASIO Focusrite · 18 ch · 48000 Hz · i32" and the
+/// routing pickers reflect the device's real channel count instead of a guess.
+#[derive(Debug, Clone, Serialize)]
+pub struct ActiveOutput {
+    pub host: String,
+    pub device: String,
+    pub channels: usize,
+    pub sample_rate: u32,
+    /// "f32" or "i32" — which callback path is feeding the device.
+    pub sample_format: String,
+    /// Negotiated callback buffer size in frames, learned from the first
+    /// callback (cpal doesn't report it up front). `None` until audio flows.
+    pub buffer_frames: Option<u32>,
 }
 
 /// Which mixed-output bus a voice routes into. Pads and cues mix into separate
@@ -208,6 +224,12 @@ pub struct AudioEngine {
     /// True while the host thread is mid-`build_stream`. Used to attribute
     /// timeouts correctly when a second SetOutput is queued behind a hung one.
     build_in_progress: Arc<AtomicBool>,
+    /// Snapshot of the currently-open stream (None when no device is up or the
+    /// last open failed). Set by the host thread, read by `active_output`.
+    active_output: Arc<Mutex<Option<ActiveOutput>>>,
+    /// Live callback buffer size in frames, written by the RT callback on each
+    /// invocation (0 = no audio has flowed yet). Read into `ActiveOutput`.
+    buffer_frames: Arc<AtomicU32>,
 }
 
 impl Default for AudioEngine {
@@ -223,15 +245,46 @@ impl AudioEngine {
         let (events_tx, events_rx) = crossbeam_channel::unbounded();
         let has_active = Arc::new(AtomicBool::new(false));
         let build_in_progress = Arc::new(AtomicBool::new(false));
+        let active_output = Arc::new(Mutex::new(None));
+        let buffer_frames = Arc::new(AtomicU32::new(0));
         let has_active_t = has_active.clone();
         let build_in_progress_t = build_in_progress.clone();
+        let active_output_t = active_output.clone();
+        let buffer_frames_t = buffer_frames.clone();
         std::thread::Builder::new()
             .name("audio-host".into())
             .spawn(move || {
-                host_thread(rx, notify_rx, notify_tx, events_tx, has_active_t, build_in_progress_t)
+                host_thread(
+                    rx,
+                    notify_rx,
+                    notify_tx,
+                    events_tx,
+                    has_active_t,
+                    build_in_progress_t,
+                    active_output_t,
+                    buffer_frames_t,
+                )
             })
             .expect("failed to spawn audio host thread");
-        AudioEngine { tx, events_rx, has_active, build_in_progress }
+        AudioEngine {
+            tx,
+            events_rx,
+            has_active,
+            build_in_progress,
+            active_output,
+            buffer_frames,
+        }
+    }
+
+    /// Snapshot of the stream that is currently open (device, channels, sample
+    /// rate, format, live buffer size), or `None` when nothing is open.
+    pub fn active_output(&self) -> Option<ActiveOutput> {
+        let mut info = self.active_output.lock().unwrap().clone();
+        if let Some(ref mut o) = info {
+            let bf = self.buffer_frames.load(Ordering::Relaxed);
+            o.buffer_frames = (bf > 0).then_some(bf);
+        }
+        info
     }
 
     /// Borrow the upstream event stream. Cloneable (crossbeam Receiver),
@@ -280,6 +333,110 @@ impl AudioEngine {
             }
         }
         out
+    }
+
+    /// Produce a full human-readable audio report — every host, every device,
+    /// its default config and all supported (format, channels, sample-rate)
+    /// combinations — and write it to the log. Returned as a string so the UI
+    /// can show or copy it. This is the artifact to ask a user for when a device
+    /// won't open: it captures exactly what cpal sees on their machine.
+    pub fn diagnostics() -> String {
+        let mut report = String::new();
+        report.push_str(&format!(
+            "StagePal audio diagnostics (v{})\n",
+            env!("CARGO_PKG_VERSION")
+        ));
+        let default_host = cpal::default_host();
+        let default_dev = default_host
+            .default_output_device()
+            .and_then(|d| d.name().ok());
+        report.push_str(&format!(
+            "default host: {} | default output: {}\n",
+            host_id_label(default_host.id()),
+            default_dev.as_deref().unwrap_or("(none)")
+        ));
+        report.push_str(&format!(
+            "hosts available: {}\n",
+            cpal::available_hosts()
+                .iter()
+                .map(|h| host_id_label(*h))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+
+        for host_id in cpal::available_hosts() {
+            let label = host_id_label(host_id);
+            report.push_str(&format!("\n== {label} ==\n"));
+            let host = match cpal::host_from_id(host_id) {
+                Ok(h) => h,
+                Err(e) => {
+                    report.push_str(&format!("  ! could not open host: {e}\n"));
+                    continue;
+                }
+            };
+            let devices = match host.output_devices() {
+                Ok(d) => d,
+                Err(e) => {
+                    report.push_str(&format!("  ! could not enumerate devices: {e}\n"));
+                    continue;
+                }
+            };
+            let mut any = false;
+            for device in devices {
+                any = true;
+                let name = device.name().unwrap_or_else(|_| "(unnamed)".into());
+                report.push_str(&format!("  • {name}\n"));
+                match device.default_output_config() {
+                    Ok(c) => report.push_str(&format!(
+                        "      default: {} ch, {} Hz, {:?}\n",
+                        c.channels(),
+                        c.sample_rate().0,
+                        c.sample_format()
+                    )),
+                    Err(e) => report.push_str(&format!("      default config error: {e}\n")),
+                }
+                match device.supported_output_configs() {
+                    Ok(cfgs) => {
+                        // Collapse the (often large) ASIO list to: per format,
+                        // the max channel count and the set of sample rates.
+                        let cfgs: Vec<_> = cfgs.collect();
+                        if cfgs.is_empty() {
+                            report.push_str("      supported: (none reported)\n");
+                        }
+                        for fmt in [
+                            SampleFormat::F32,
+                            SampleFormat::I32,
+                            SampleFormat::I16,
+                            SampleFormat::U16,
+                        ] {
+                            let matching: Vec<_> =
+                                cfgs.iter().filter(|c| c.sample_format() == fmt).collect();
+                            if matching.is_empty() {
+                                continue;
+                            }
+                            let max_ch =
+                                matching.iter().map(|c| c.channels()).max().unwrap_or(0);
+                            let mut rates: Vec<u32> = matching
+                                .iter()
+                                .map(|c| c.max_sample_rate().0)
+                                .collect();
+                            rates.sort_unstable();
+                            rates.dedup();
+                            report.push_str(&format!(
+                                "      supported {fmt:?}: up to {max_ch} ch @ {rates:?} Hz\n"
+                            ));
+                        }
+                    }
+                    Err(e) => report.push_str(&format!("      supported configs error: {e}\n")),
+                }
+            }
+            if !any {
+                report.push_str("  (no output devices)\n");
+            }
+        }
+
+        crate::linfo!("audio diagnostics requested:\n{report}");
+        report
     }
 
     pub fn set_output(
@@ -420,6 +577,8 @@ struct ActiveStream {
     _stream: cpal::Stream,
     cmd_tx: rtrb::Producer<PlayCommand>,
     out_rate: u32,
+    /// What this stream actually opened as, for the UI / diagnostics.
+    info: ActiveOutput,
 }
 
 const DEFAULT_CROSSFADE_MS: u32 = 2000;
@@ -445,45 +604,18 @@ fn host_from_label(label: &str) -> Result<cpal::Host, String> {
     Err(format!("audio host '{label}' is not available"))
 }
 
-/// Brief (channels, sample_rate) summary for device-list rendering.
-/// Prefers an f32 config (matches the default `build_output_stream` path) and
-/// falls back to whatever the default config reports.
+/// Brief (channels, sample_rate) summary for device-list rendering. Mirrors
+/// `pick_supported` so the dropdown shows the channel count and rate the device
+/// will *actually* open with — not a different probe that could disagree (which
+/// is exactly how the old ASIO bug hid: the list showed 18 ch while the stream
+/// opened mono). Returns `None` if no f32/i32 config is reachable, so such a
+/// device is dropped from the picker instead of looking selectable-but-broken.
 fn best_output_summary(device: &cpal::Device) -> Option<(usize, u32)> {
-    if let Ok(configs) = device.supported_output_configs() {
-        // Highest channel count + a reasonable default sample rate.
-        let mut best: Option<(u16, u32, SampleFormat)> = None;
-        for cfg in configs {
-            let channels = cfg.channels();
-            let sr = cfg.max_sample_rate().0.min(48_000).max(cfg.min_sample_rate().0);
-            let fmt = cfg.sample_format();
-            // Prefer f32 over i32 when both are available, otherwise prefer
-            // higher channel count.
-            let candidate = (channels, sr, fmt);
-            best = Some(match best {
-                None => candidate,
-                Some(cur) => {
-                    let cur_f32 = matches!(cur.2, SampleFormat::F32);
-                    let new_f32 = matches!(fmt, SampleFormat::F32);
-                    if new_f32 && !cur_f32 {
-                        candidate
-                    } else if !new_f32 && cur_f32 {
-                        cur
-                    } else if channels > cur.0 {
-                        candidate
-                    } else {
-                        cur
-                    }
-                }
-            });
-        }
-        if let Some((ch, sr, _)) = best {
-            return Some((ch as usize, sr));
-        }
-    }
-    let cfg = device.default_output_config().ok()?;
+    let cfg = pick_supported(device).ok()?;
     Some((cfg.channels() as usize, cfg.sample_rate().0))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn host_thread(
     rx: Receiver<EngineCommand>,
     notify_rx: Receiver<HostNotify>,
@@ -491,6 +623,8 @@ fn host_thread(
     events: crossbeam_channel::Sender<EngineEvent>,
     has_active: Arc<AtomicBool>,
     build_in_progress: Arc<AtomicBool>,
+    active_output: Arc<Mutex<Option<ActiveOutput>>>,
+    buffer_frames: Arc<AtomicU32>,
 ) {
     let mut active: Option<ActiveStream> = None;
     let mut master: f32 = 0.8;
@@ -566,7 +700,7 @@ fn host_thread(
                     cue: cue_channels,
                 };
                 build_in_progress.store(true, Ordering::Relaxed);
-                let result = build_stream(&host, &device, channels, master, cue_volume, click_init);
+                let result = build_stream(&host, &device, channels, master, cue_volume, click_init, &buffer_frames);
                 build_in_progress.store(false, Ordering::Relaxed);
                 match result {
                     Ok(stream) => {
@@ -585,13 +719,16 @@ fn host_thread(
                         last_host = host;
                         last_device = device;
                         last_channels = channels;
+                        *active_output.lock().unwrap() = Some(stream.info.clone());
                         active = Some(stream);
                         has_active.store(true, Ordering::Relaxed);
                         let _ = reply.send(Ok(()));
                     }
                     Err(e) => {
+                        crate::lerror!("[audio] set_output failed: {e}");
                         active = None;
                         has_active.store(false, Ordering::Relaxed);
+                        *active_output.lock().unwrap() = None;
                         // The device that just failed isn't worth retrying for
                         // subsequent channel-only edits — clear `last_*` so the
                         // next SetClickChannels/SetCueChannels short-circuits
@@ -617,7 +754,7 @@ fn host_thread(
                 };
                 let next = ChannelLayout { click: channels, ..last_channels };
                 build_in_progress.store(true, Ordering::Relaxed);
-                let result = build_stream(&last_host, &last_device, next, master, cue_volume, click_init);
+                let result = build_stream(&last_host, &last_device, next, master, cue_volume, click_init, &buffer_frames);
                 build_in_progress.store(false, Ordering::Relaxed);
                 match result {
                     Ok(stream) => {
@@ -628,13 +765,16 @@ fn host_thread(
                             let _ = events.send(EngineEvent::CueEnded);
                         }
                         last_channels = next;
+                        *active_output.lock().unwrap() = Some(stream.info.clone());
                         active = Some(stream);
                         has_active.store(true, Ordering::Relaxed);
                         let _ = reply.send(Ok(()));
                     }
                     Err(e) => {
+                        crate::lerror!("[audio] re-open for channel change failed: {e}");
                         active = None;
                         has_active.store(false, Ordering::Relaxed);
+                        *active_output.lock().unwrap() = None;
                         last_host.clear();
                         last_device.clear();
                         let _ = reply.send(Err(e));
@@ -655,7 +795,7 @@ fn host_thread(
                 };
                 let next = ChannelLayout { cue: channels, ..last_channels };
                 build_in_progress.store(true, Ordering::Relaxed);
-                let result = build_stream(&last_host, &last_device, next, master, cue_volume, click_init);
+                let result = build_stream(&last_host, &last_device, next, master, cue_volume, click_init, &buffer_frames);
                 build_in_progress.store(false, Ordering::Relaxed);
                 match result {
                     Ok(stream) => {
@@ -666,13 +806,16 @@ fn host_thread(
                             let _ = events.send(EngineEvent::CueEnded);
                         }
                         last_channels = next;
+                        *active_output.lock().unwrap() = Some(stream.info.clone());
                         active = Some(stream);
                         has_active.store(true, Ordering::Relaxed);
                         let _ = reply.send(Ok(()));
                     }
                     Err(e) => {
+                        crate::lerror!("[audio] re-open for channel change failed: {e}");
                         active = None;
                         has_active.store(false, Ordering::Relaxed);
+                        *active_output.lock().unwrap() = None;
                         last_host.clear();
                         last_device.clear();
                         let _ = reply.send(Err(e));
@@ -891,45 +1034,58 @@ fn host_thread(
 
 /// Pick a usable supported config: prefer f32 (matches WASAPI default), fall
 /// back to i32 (typical for ASIO drivers). Anything else is rejected.
-fn pick_supported(
-    device: &cpal::Device,
-) -> Result<cpal::SupportedStreamConfig, String> {
+/// Choose the stream config to open a device with.
+///
+/// The device's *default* config is the right answer for almost every device:
+/// it carries the full physical channel count, the driver's current sample rate
+/// (so we don't force an ASIO clock change that can fail or glitch other apps),
+/// and the native sample format. We only fall back to scanning `supported_output_configs`
+/// when the default's format isn't one we can feed (we render f32/i32).
+///
+/// History: the old code took the *first* matching config from
+/// `supported_output_configs()`. That worked on WASAPI (whose first config is the
+/// stereo mix format) but broke every ASIO device — cpal's ASIO backend
+/// enumerates configs starting at **1 channel**, so the first match was mono and
+/// the pad bus on channels (0,1) was rejected as "out of range". Selecting by max
+/// channel count (and preferring the native default) is what makes ASIO work.
+fn pick_supported(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, String> {
+    // 1. Prefer the driver's own default — full channels, native rate + format.
+    if let Ok(cfg) = device.default_output_config() {
+        if matches!(cfg.sample_format(), SampleFormat::F32 | SampleFormat::I32) {
+            return Ok(cfg);
+        }
+    }
+
+    // 2. Otherwise scan: among f32 (preferred) then i32 ranges, take the one
+    //    with the MOST channels so multi-out routing has room to land. Pin the
+    //    rate to the device default when that rate is offered, else max.
     let configs: Vec<_> = device
         .supported_output_configs()
         .map_err(|e| format!("supported configs: {e}"))?
         .collect();
+    let default_rate = device.default_output_config().ok().map(|c| c.sample_rate());
 
-    // Prefer f32 at the device's max-supported sample rate, falling back to i32.
-    let pick = |fmt: SampleFormat| {
-        configs
+    let pick = |fmt: SampleFormat| -> Option<cpal::SupportedStreamConfig> {
+        let range = configs
             .iter()
-            .find(|c| c.sample_format() == fmt)
-            .cloned()
-            .map(|c| c.with_max_sample_rate())
+            .filter(|c| c.sample_format() == fmt)
+            .max_by_key(|c| c.channels())?;
+        // Use the device's default rate if this range covers it, else its max.
+        let cfg = match default_rate {
+            Some(r) if r >= range.min_sample_rate() && r <= range.max_sample_rate() => {
+                range.clone().with_sample_rate(r)
+            }
+            _ => range.clone().with_max_sample_rate(),
+        };
+        Some(cfg)
     };
 
-    if let Some(c) = pick(SampleFormat::F32) {
-        return Ok(c);
-    }
-    if let Some(c) = pick(SampleFormat::I32) {
-        return Ok(c);
-    }
-
-    // Last resort: whatever the driver reports as default.
-    let fallback = device
-        .default_output_config()
-        .map_err(|e| format!("default config: {e}"))?;
-    if matches!(
-        fallback.sample_format(),
-        SampleFormat::F32 | SampleFormat::I32
-    ) {
-        Ok(fallback)
-    } else {
-        Err(format!(
-            "device sample format {:?} is not supported (need f32 or i32)",
-            fallback.sample_format()
-        ))
-    }
+    pick(SampleFormat::F32)
+        .or_else(|| pick(SampleFormat::I32))
+        .ok_or_else(|| {
+            "device exposes no f32/i32 output config — cpal can only feed those formats"
+                .to_string()
+        })
 }
 
 /// A stereo bus's routing: physical channel indexes on the output device.
@@ -977,7 +1133,18 @@ fn build_stream(
     master: f32,
     cue_volume: f32,
     click_init: ClickInit,
+    buffer_frames: &Arc<AtomicU32>,
 ) -> Result<ActiveStream, String> {
+    crate::linfo!(
+        "[audio] opening {host_label}/{device_name} — pad={:?} click={:?} cue={:?}",
+        channels.pad,
+        channels.click,
+        channels.cue
+    );
+    // A fresh open hasn't produced a callback yet; clear the stale buffer size
+    // so `active_output` doesn't report the previous device's value.
+    buffer_frames.store(0, Ordering::Relaxed);
+
     let host = host_from_label(host_label)?;
     let device = host
         .output_devices()
@@ -990,13 +1157,21 @@ fn build_stream(
     let config: cpal::StreamConfig = supported.config();
     let total_channels = config.channels as usize;
     let out_rate = config.sample_rate.0;
+    crate::linfo!(
+        "[audio] {device_name}: selected {total_channels} ch @ {out_rate} Hz, {sample_format:?}"
+    );
     let (pad_l, pad_r) = channels.pad;
     let (click_l, click_r) = channels.click;
     let (cue_l, cue_r) = channels.cue;
 
     if pad_l >= total_channels || pad_r >= total_channels {
+        // With a healthy multi-out device this can't happen (pad defaults to
+        // 0/1). It only fires if the driver opened with <2 outputs — usually an
+        // ASIO control-panel set to mono. Say so instead of a bare index error.
         return Err(format!(
-            "pad channel pair ({pad_l},{pad_r}) out of range; device has {total_channels} channels"
+            "pad channels ({pad_l},{pad_r}) don't fit — {device_name} opened with only \
+             {total_channels} output channel(s). Open the device's ASIO control panel and \
+             enable at least 2 outputs."
         ));
     }
     // Click and cue channels are allowed to be out of range — the callback
@@ -1017,16 +1192,17 @@ fn build_stream(
     // Lock-free queue: host thread → real-time callback.
     let (cmd_tx, cmd_rx) = RingBuffer::<PlayCommand>::new(64);
 
-    let err_fn = |err| eprintln!("[audio] stream error: {err}");
+    let err_fn = |err| crate::lerror!("[audio] stream runtime error: {err}");
+    let bf = buffer_frames.clone();
     let stream = match sample_format {
         SampleFormat::F32 => {
-            let cb = build_callback_f32(layout, master, cue_volume, click_gen, cmd_rx);
+            let cb = build_callback_f32(layout, master, cue_volume, click_gen, cmd_rx, bf);
             device
                 .build_output_stream(&config, cb, err_fn, None)
                 .map_err(|e| format!("build output stream (f32): {e}"))?
         }
         SampleFormat::I32 => {
-            let cb = build_callback_i32(layout, master, cue_volume, click_gen, cmd_rx);
+            let cb = build_callback_i32(layout, master, cue_volume, click_gen, cmd_rx, bf);
             device
                 .build_output_stream(&config, cb, err_fn, None)
                 .map_err(|e| format!("build output stream (i32): {e}"))?
@@ -1038,10 +1214,23 @@ fn build_stream(
         .play()
         .map_err(|e| format!("start stream: {e}"))?;
 
+    crate::linfo!("[audio] stream live on {host_label}/{device_name}");
     Ok(ActiveStream {
         _stream: stream,
         cmd_tx,
         out_rate,
+        info: ActiveOutput {
+            host: host_label.to_string(),
+            device: device_name.to_string(),
+            channels: total_channels,
+            sample_rate: out_rate,
+            sample_format: match sample_format {
+                SampleFormat::F32 => "f32".to_string(),
+                SampleFormat::I32 => "i32".to_string(),
+                other => format!("{other:?}"),
+            },
+            buffer_frames: None,
+        },
     })
 }
 
@@ -1367,6 +1556,7 @@ fn build_callback_f32(
     cue_volume_init: f32,
     click_init: ClickGen,
     mut cmd_rx: rtrb::Consumer<PlayCommand>,
+    buffer_frames: Arc<AtomicU32>,
 ) -> impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut voices: Vec<Voice> = Vec::with_capacity(4);
     let mut master = master_init;
@@ -1374,6 +1564,10 @@ fn build_callback_f32(
     let mut click = click_init;
 
     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        // Publish the negotiated buffer size (frames) for diagnostics. Cheap,
+        // RT-safe relaxed store; the value only changes if the driver resizes.
+        let frames = (data.len() / layout.total.max(1)) as u32;
+        buffer_frames.store(frames, Ordering::Relaxed);
         drain_commands(&mut voices, &mut master, &mut cue_volume, &mut click, &mut cmd_rx);
 
         for frame in data.chunks_mut(layout.total) {
@@ -1390,6 +1584,7 @@ fn build_callback_i32(
     cue_volume_init: f32,
     click_init: ClickGen,
     mut cmd_rx: rtrb::Consumer<PlayCommand>,
+    buffer_frames: Arc<AtomicU32>,
 ) -> impl FnMut(&mut [i32], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut voices: Vec<Voice> = Vec::with_capacity(4);
     let mut master = master_init;
@@ -1404,6 +1599,8 @@ fn build_callback_i32(
     let mut scratch = [0.0f32; 64];
 
     move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
+        let frames = (data.len() / layout.total.max(1)) as u32;
+        buffer_frames.store(frames, Ordering::Relaxed);
         drain_commands(&mut voices, &mut master, &mut cue_volume, &mut click, &mut cmd_rx);
 
         for frame in data.chunks_mut(layout.total) {
