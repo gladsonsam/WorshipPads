@@ -3,4 +3,4 @@
 mod decode;
 mod engine;
 
-pub use engine::{AudioEngine, DeviceInfo, EngineEvent};
+pub use engine::{AudioDebugReport, AudioEngine, DeviceInfo, EngineEvent};

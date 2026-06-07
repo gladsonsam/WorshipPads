@@ -12,7 +12,7 @@
 //!     never locks, allocates, or touches the filesystem.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,6 +60,23 @@ pub struct DeviceInfo {
     pub default_sample_rate: u32,
     /// True if this is the default output device on the default host.
     pub is_default: bool,
+}
+
+/// Result from the built-in routed test tone. This is deliberately surfaced to
+/// production builds so a real ASIO rig can tell us whether the callback is
+/// alive and writing nonzero samples, even when the mixer remains silent.
+#[derive(Debug, Clone, Serialize)]
+pub struct AudioDebugReport {
+    pub host: String,
+    pub device: String,
+    pub sample_format: String,
+    pub sample_rate: u32,
+    pub channels: usize,
+    pub pad_channels: (usize, usize),
+    pub callback_calls: u64,
+    pub frames_written: u64,
+    pub nonzero_frames: u64,
+    pub peak: f32,
 }
 
 /// Which mixed-output bus a voice routes into. Pads and cues mix into separate
@@ -113,6 +130,9 @@ enum PlayCommand {
     /// Toggle the cue→click ducking ramp (true while a cue is speaking AND
     /// the user has duck_click enabled).
     SetClickDuckActive(bool),
+    /// Short sine tone mixed directly onto the pad bus. Used for field
+    /// diagnostics because it bypasses file decode and pad library state.
+    StartDiagnosticTone(DiagnosticTone),
 }
 
 /// Initial click configuration handed to the audio callback when it's built.
@@ -163,6 +183,29 @@ enum EngineCommand {
     SetClickVolume(f32),
     /// Persisted "duck the click while a cue speaks" toggle.
     SetDuckClick(bool),
+    RunOutputTest {
+        reply: Sender<Result<AudioDebugReport, String>>,
+    },
+}
+
+#[derive(Clone)]
+struct StreamDebugInfo {
+    host: String,
+    device: String,
+    sample_format: String,
+    sample_rate: u32,
+    channels: usize,
+    pad_channels: (usize, usize),
+}
+
+struct DiagnosticTone {
+    phase: f32,
+    phase_inc: f32,
+    frames_left: u64,
+    total_frames: Arc<AtomicU64>,
+    nonzero_frames: Arc<AtomicU64>,
+    callback_calls: Arc<AtomicU64>,
+    peak_bits: Arc<AtomicU32>,
 }
 
 /// Internal messages sent from watcher threads back into the host thread.
@@ -228,10 +271,22 @@ impl AudioEngine {
         std::thread::Builder::new()
             .name("audio-host".into())
             .spawn(move || {
-                host_thread(rx, notify_rx, notify_tx, events_tx, has_active_t, build_in_progress_t)
+                host_thread(
+                    rx,
+                    notify_rx,
+                    notify_tx,
+                    events_tx,
+                    has_active_t,
+                    build_in_progress_t,
+                )
             })
             .expect("failed to spawn audio host thread");
-        AudioEngine { tx, events_rx, has_active, build_in_progress }
+        AudioEngine {
+            tx,
+            events_rx,
+            has_active,
+            build_in_progress,
+        }
     }
 
     /// Borrow the upstream event stream. Cloneable (crossbeam Receiver),
@@ -413,6 +468,23 @@ impl AudioEngine {
             .send(EngineCommand::SetCrossfade(ms))
             .map_err(|_| "audio host thread is gone".to_string())
     }
+
+    pub fn run_output_test(&self) -> Result<AudioDebugReport, String> {
+        if !self.has_active.load(Ordering::Relaxed) {
+            return Err("audio output not ready - set or restore an output device first".into());
+        }
+        let (reply, reply_rx) = crossbeam_channel::bounded(1);
+        self.tx
+            .send(EngineCommand::RunOutputTest { reply })
+            .map_err(|_| "audio host thread is gone".to_string())?;
+        match reply_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(r) => r,
+            Err(RecvTimeoutError::Timeout) => {
+                Err("audio output test timed out - callback may not be running".into())
+            }
+            Err(RecvTimeoutError::Disconnected) => Err("audio host thread did not reply".into()),
+        }
+    }
 }
 
 /// Live stream + the producer end of the callback's command queue.
@@ -420,6 +492,7 @@ struct ActiveStream {
     _stream: cpal::Stream,
     cmd_tx: rtrb::Producer<PlayCommand>,
     out_rate: u32,
+    debug: StreamDebugInfo,
 }
 
 const DEFAULT_CROSSFADE_MS: u32 = 2000;
@@ -454,7 +527,11 @@ fn best_output_summary(device: &cpal::Device) -> Option<(usize, u32)> {
         let mut best: Option<(u16, u32, SampleFormat)> = None;
         for cfg in configs {
             let channels = cfg.channels();
-            let sr = cfg.max_sample_rate().0.min(48_000).max(cfg.min_sample_rate().0);
+            let sr = cfg
+                .max_sample_rate()
+                .0
+                .min(48_000)
+                .max(cfg.min_sample_rate().0);
             let fmt = cfg.sample_format();
             // Prefer f32 over i32 when both are available, otherwise prefer
             // higher channel count.
@@ -545,309 +622,385 @@ fn host_thread(
                 Err(_) => break,
             };
             match cmd {
-            EngineCommand::SetOutput {
-                host,
-                device,
-                pad_channels,
-                click_channels,
-                cue_channels,
-                reply,
-            } => {
-                let click_init = ClickInit {
-                    enabled: click_enabled,
-                    bpm: click_bpm,
-                    beats_per_bar: click_beats,
-                    accent: click_accent,
-                    volume: click_volume,
-                };
-                let channels = ChannelLayout {
-                    pad: pad_channels,
-                    click: click_channels,
-                    cue: cue_channels,
-                };
-                build_in_progress.store(true, Ordering::Relaxed);
-                let result = build_stream(&host, &device, channels, master, cue_volume, click_init);
-                build_in_progress.store(false, Ordering::Relaxed);
-                match result {
-                    Ok(stream) => {
-                        // Replacing the old stream drops it and every voice it
-                        // was carrying. Invalidate any orphan pad/cue watcher,
-                        // flush playing-state immediately (don't wait for the
-                        // ~300ms watcher tail), and re-apply the cue duck on
-                        // the freshly-built stream so a mid-cue rebuild
-                        // doesn't slam the click back to full volume.
-                        pad_generation.fetch_add(1, Ordering::Relaxed);
-                        cue_generation.fetch_add(1, Ordering::Relaxed);
-                        if cue_active {
-                            cue_active = false;
-                            let _ = events.send(EngineEvent::CueEnded);
+                EngineCommand::SetOutput {
+                    host,
+                    device,
+                    pad_channels,
+                    click_channels,
+                    cue_channels,
+                    reply,
+                } => {
+                    let click_init = ClickInit {
+                        enabled: click_enabled,
+                        bpm: click_bpm,
+                        beats_per_bar: click_beats,
+                        accent: click_accent,
+                        volume: click_volume,
+                    };
+                    let channels = ChannelLayout {
+                        pad: pad_channels,
+                        click: click_channels,
+                        cue: cue_channels,
+                    };
+                    build_in_progress.store(true, Ordering::Relaxed);
+                    let result =
+                        build_stream(&host, &device, channels, master, cue_volume, click_init);
+                    build_in_progress.store(false, Ordering::Relaxed);
+                    match result {
+                        Ok(stream) => {
+                            // Replacing the old stream drops it and every voice it
+                            // was carrying. Invalidate any orphan pad/cue watcher,
+                            // flush playing-state immediately (don't wait for the
+                            // ~300ms watcher tail), and re-apply the cue duck on
+                            // the freshly-built stream so a mid-cue rebuild
+                            // doesn't slam the click back to full volume.
+                            pad_generation.fetch_add(1, Ordering::Relaxed);
+                            cue_generation.fetch_add(1, Ordering::Relaxed);
+                            if cue_active {
+                                cue_active = false;
+                                let _ = events.send(EngineEvent::CueEnded);
+                            }
+                            last_host = host;
+                            last_device = device;
+                            last_channels = channels;
+                            active = Some(stream);
+                            has_active.store(true, Ordering::Relaxed);
+                            let _ = reply.send(Ok(()));
                         }
-                        last_host = host;
-                        last_device = device;
-                        last_channels = channels;
-                        active = Some(stream);
-                        has_active.store(true, Ordering::Relaxed);
-                        let _ = reply.send(Ok(()));
-                    }
-                    Err(e) => {
-                        active = None;
-                        has_active.store(false, Ordering::Relaxed);
-                        // The device that just failed isn't worth retrying for
-                        // subsequent channel-only edits — clear `last_*` so the
-                        // next SetClickChannels/SetCueChannels short-circuits
-                        // with an honest "no device" response instead of
-                        // re-running the same failure under the hood.
-                        last_host.clear();
-                        last_device.clear();
-                        let _ = reply.send(Err(e));
-                    }
-                }
-            }
-            EngineCommand::SetClickChannels { channels, reply } => {
-                if last_device.is_empty() {
-                    let _ = reply.send(Ok(()));
-                    continue;
-                }
-                let click_init = ClickInit {
-                    enabled: click_enabled,
-                    bpm: click_bpm,
-                    beats_per_bar: click_beats,
-                    accent: click_accent,
-                    volume: click_volume,
-                };
-                let next = ChannelLayout { click: channels, ..last_channels };
-                build_in_progress.store(true, Ordering::Relaxed);
-                let result = build_stream(&last_host, &last_device, next, master, cue_volume, click_init);
-                build_in_progress.store(false, Ordering::Relaxed);
-                match result {
-                    Ok(stream) => {
-                        pad_generation.fetch_add(1, Ordering::Relaxed);
-                        cue_generation.fetch_add(1, Ordering::Relaxed);
-                        if cue_active {
-                            cue_active = false;
-                            let _ = events.send(EngineEvent::CueEnded);
+                        Err(e) => {
+                            active = None;
+                            has_active.store(false, Ordering::Relaxed);
+                            // The device that just failed isn't worth retrying for
+                            // subsequent channel-only edits — clear `last_*` so the
+                            // next SetClickChannels/SetCueChannels short-circuits
+                            // with an honest "no device" response instead of
+                            // re-running the same failure under the hood.
+                            last_host.clear();
+                            last_device.clear();
+                            let _ = reply.send(Err(e));
                         }
-                        last_channels = next;
-                        active = Some(stream);
-                        has_active.store(true, Ordering::Relaxed);
+                    }
+                }
+                EngineCommand::SetClickChannels { channels, reply } => {
+                    if last_device.is_empty() {
                         let _ = reply.send(Ok(()));
+                        continue;
                     }
-                    Err(e) => {
-                        active = None;
-                        has_active.store(false, Ordering::Relaxed);
-                        last_host.clear();
-                        last_device.clear();
-                        let _ = reply.send(Err(e));
-                    }
-                }
-            }
-            EngineCommand::SetCueChannels { channels, reply } => {
-                if last_device.is_empty() {
-                    let _ = reply.send(Ok(()));
-                    continue;
-                }
-                let click_init = ClickInit {
-                    enabled: click_enabled,
-                    bpm: click_bpm,
-                    beats_per_bar: click_beats,
-                    accent: click_accent,
-                    volume: click_volume,
-                };
-                let next = ChannelLayout { cue: channels, ..last_channels };
-                build_in_progress.store(true, Ordering::Relaxed);
-                let result = build_stream(&last_host, &last_device, next, master, cue_volume, click_init);
-                build_in_progress.store(false, Ordering::Relaxed);
-                match result {
-                    Ok(stream) => {
-                        pad_generation.fetch_add(1, Ordering::Relaxed);
-                        cue_generation.fetch_add(1, Ordering::Relaxed);
-                        if cue_active {
-                            cue_active = false;
-                            let _ = events.send(EngineEvent::CueEnded);
+                    let click_init = ClickInit {
+                        enabled: click_enabled,
+                        bpm: click_bpm,
+                        beats_per_bar: click_beats,
+                        accent: click_accent,
+                        volume: click_volume,
+                    };
+                    let next = ChannelLayout {
+                        click: channels,
+                        ..last_channels
+                    };
+                    build_in_progress.store(true, Ordering::Relaxed);
+                    let result = build_stream(
+                        &last_host,
+                        &last_device,
+                        next,
+                        master,
+                        cue_volume,
+                        click_init,
+                    );
+                    build_in_progress.store(false, Ordering::Relaxed);
+                    match result {
+                        Ok(stream) => {
+                            pad_generation.fetch_add(1, Ordering::Relaxed);
+                            cue_generation.fetch_add(1, Ordering::Relaxed);
+                            if cue_active {
+                                cue_active = false;
+                                let _ = events.send(EngineEvent::CueEnded);
+                            }
+                            last_channels = next;
+                            active = Some(stream);
+                            has_active.store(true, Ordering::Relaxed);
+                            let _ = reply.send(Ok(()));
                         }
-                        last_channels = next;
-                        active = Some(stream);
-                        has_active.store(true, Ordering::Relaxed);
-                        let _ = reply.send(Ok(()));
-                    }
-                    Err(e) => {
-                        active = None;
-                        has_active.store(false, Ordering::Relaxed);
-                        last_host.clear();
-                        last_device.clear();
-                        let _ = reply.send(Err(e));
+                        Err(e) => {
+                            active = None;
+                            has_active.store(false, Ordering::Relaxed);
+                            last_host.clear();
+                            last_device.clear();
+                            let _ = reply.send(Err(e));
+                        }
                     }
                 }
-            }
-            EngineCommand::Play(path) => {
-                if let Some(act) = active.as_mut() {
-                    let dec = decode::spawn(path, act.out_rate, true, false);
+                EngineCommand::SetCueChannels { channels, reply } => {
+                    if last_device.is_empty() {
+                        let _ = reply.send(Ok(()));
+                        continue;
+                    }
+                    let click_init = ClickInit {
+                        enabled: click_enabled,
+                        bpm: click_bpm,
+                        beats_per_bar: click_beats,
+                        accent: click_accent,
+                        volume: click_volume,
+                    };
+                    let next = ChannelLayout {
+                        cue: channels,
+                        ..last_channels
+                    };
+                    build_in_progress.store(true, Ordering::Relaxed);
+                    let result = build_stream(
+                        &last_host,
+                        &last_device,
+                        next,
+                        master,
+                        cue_volume,
+                        click_init,
+                    );
+                    build_in_progress.store(false, Ordering::Relaxed);
+                    match result {
+                        Ok(stream) => {
+                            pad_generation.fetch_add(1, Ordering::Relaxed);
+                            cue_generation.fetch_add(1, Ordering::Relaxed);
+                            if cue_active {
+                                cue_active = false;
+                                let _ = events.send(EngineEvent::CueEnded);
+                            }
+                            last_channels = next;
+                            active = Some(stream);
+                            has_active.store(true, Ordering::Relaxed);
+                            let _ = reply.send(Ok(()));
+                        }
+                        Err(e) => {
+                            active = None;
+                            has_active.store(false, Ordering::Relaxed);
+                            last_host.clear();
+                            last_device.clear();
+                            let _ = reply.send(Err(e));
+                        }
+                    }
+                }
+                EngineCommand::Play(path) => {
+                    if let Some(act) = active.as_mut() {
+                        let dec = decode::spawn(path, act.out_rate, true, false);
+                        let voice = Voice {
+                            consumer: dec.consumer,
+                            stop: dec.stop,
+                            ended: dec.ended.clone(),
+                            bus: VoiceBus::Pad,
+                            gain: 0.0,
+                            target: 1.0,
+                            step: fade_step(crossfade_ms, act.out_rate),
+                            remove_when_silent: false,
+                        };
+                        let _ = act.cmd_tx.push(PlayCommand::Crossfade(voice));
+                        // Bump the pad generation, then spawn a watcher tied to
+                        // this generation. If the decoder later exits for any
+                        // reason — natural crossfade-stop, explicit Stop, or an
+                        // error mid-set — the host will see NotifyPadEnded.
+                        // The host only emits EngineEvent::PadEnded when the
+                        // generation still matches: a crossfade or Stop bumps the
+                        // generation first, so those legitimate exits stay quiet.
+                        let my_gen = pad_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                        let watcher_ended = dec.ended;
+                        let watcher_notify = notify_tx.clone();
+                        let watcher_gen_arc = pad_generation.clone();
+                        std::thread::Builder::new()
+                            .name("pad-watcher".into())
+                            .spawn(move || {
+                                while !watcher_ended.load(Ordering::Relaxed) {
+                                    std::thread::sleep(Duration::from_millis(200));
+                                }
+                                // Skip post if the pad has already been replaced
+                                // (saves a no-op trip through the host loop).
+                                if watcher_gen_arc.load(Ordering::Relaxed) == my_gen {
+                                    let _ = watcher_notify.send(HostNotify::PadEnded(my_gen));
+                                }
+                            })
+                            .ok();
+                    } else {
+                        eprintln!("[audio] Play ignored: no output device configured");
+                    }
+                }
+                EngineCommand::Stop => {
+                    if let Some(act) = active.as_mut() {
+                        // Invalidate the current pad watcher so its eventual
+                        // PadEnded post is ignored — the user initiated the stop,
+                        // they don't need a redundant "pad ended" event.
+                        pad_generation.fetch_add(1, Ordering::Relaxed);
+                        let step = fade_step(crossfade_ms, act.out_rate);
+                        let _ = act.cmd_tx.push(PlayCommand::FadeOutAll(step));
+                    }
+                }
+                EngineCommand::PlayCue(path) => {
+                    let Some(act) = active.as_mut() else {
+                        eprintln!("[audio] PlayCue ignored: no output device configured");
+                        // The synthesized temp WAV would normally be deleted by
+                        // decode::spawn's thread on exit (delete_on_exit=true).
+                        // We never reach that path here, so clean up directly
+                        // instead of leaking the file in %TEMP%.
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    };
+                    let dec = decode::spawn(path, act.out_rate, false, true);
                     let voice = Voice {
                         consumer: dec.consumer,
                         stop: dec.stop,
                         ended: dec.ended.clone(),
-                        bus: VoiceBus::Pad,
-                        gain: 0.0,
+                        bus: VoiceBus::Cue,
+                        gain: 1.0,
                         target: 1.0,
-                        step: fade_step(crossfade_ms, act.out_rate),
+                        // Short fade-in/out so cue start/stop never click. Not a
+                        // pad-style crossfade — voice is a one-shot.
+                        step: fade_step(50, act.out_rate),
                         remove_when_silent: false,
                     };
-                    let _ = act.cmd_tx.push(PlayCommand::Crossfade(voice));
-                    // Bump the pad generation, then spawn a watcher tied to
-                    // this generation. If the decoder later exits for any
-                    // reason — natural crossfade-stop, explicit Stop, or an
-                    // error mid-set — the host will see NotifyPadEnded.
-                    // The host only emits EngineEvent::PadEnded when the
-                    // generation still matches: a crossfade or Stop bumps the
-                    // generation first, so those legitimate exits stay quiet.
-                    let my_gen = pad_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = act.cmd_tx.push(PlayCommand::PushCue(voice));
+                    cue_active = true;
+                    let my_gen = cue_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = events.send(EngineEvent::CueStarted);
+                    if duck_click_pref {
+                        let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(true));
+                    }
+                    // Watcher: when the decoder signals "ended", give the audio
+                    // buffer ~300 ms to drain, then post a notification back to
+                    // the engine loop. Routing through the internal notify
+                    // channel (not straight to `events`) is what lets the loop
+                    // clear `cue_active` and lift the click duck before
+                    // broadcasting CueEnded.
                     let watcher_ended = dec.ended;
                     let watcher_notify = notify_tx.clone();
-                    let watcher_gen_arc = pad_generation.clone();
                     std::thread::Builder::new()
-                        .name("pad-watcher".into())
+                        .name("cue-watcher".into())
                         .spawn(move || {
                             while !watcher_ended.load(Ordering::Relaxed) {
-                                std::thread::sleep(Duration::from_millis(200));
+                                std::thread::sleep(Duration::from_millis(100));
                             }
-                            // Skip post if the pad has already been replaced
-                            // (saves a no-op trip through the host loop).
-                            if watcher_gen_arc.load(Ordering::Relaxed) == my_gen {
-                                let _ = watcher_notify.send(HostNotify::PadEnded(my_gen));
-                            }
+                            std::thread::sleep(Duration::from_millis(300));
+                            let _ = watcher_notify.send(HostNotify::CueEnded(my_gen));
                         })
                         .ok();
-                } else {
-                    eprintln!("[audio] Play ignored: no output device configured");
                 }
-            }
-            EngineCommand::Stop => {
-                if let Some(act) = active.as_mut() {
-                    // Invalidate the current pad watcher so its eventual
-                    // PadEnded post is ignored — the user initiated the stop,
-                    // they don't need a redundant "pad ended" event.
-                    pad_generation.fetch_add(1, Ordering::Relaxed);
-                    let step = fade_step(crossfade_ms, act.out_rate);
-                    let _ = act.cmd_tx.push(PlayCommand::FadeOutAll(step));
-                }
-            }
-            EngineCommand::PlayCue(path) => {
-                let Some(act) = active.as_mut() else {
-                    eprintln!("[audio] PlayCue ignored: no output device configured");
-                    // The synthesized temp WAV would normally be deleted by
-                    // decode::spawn's thread on exit (delete_on_exit=true).
-                    // We never reach that path here, so clean up directly
-                    // instead of leaking the file in %TEMP%.
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                };
-                let dec = decode::spawn(path, act.out_rate, false, true);
-                let voice = Voice {
-                    consumer: dec.consumer,
-                    stop: dec.stop,
-                    ended: dec.ended.clone(),
-                    bus: VoiceBus::Cue,
-                    gain: 1.0,
-                    target: 1.0,
-                    // Short fade-in/out so cue start/stop never click. Not a
-                    // pad-style crossfade — voice is a one-shot.
-                    step: fade_step(50, act.out_rate),
-                    remove_when_silent: false,
-                };
-                let _ = act.cmd_tx.push(PlayCommand::PushCue(voice));
-                cue_active = true;
-                let my_gen = cue_generation.fetch_add(1, Ordering::Relaxed) + 1;
-                let _ = events.send(EngineEvent::CueStarted);
-                if duck_click_pref {
-                    let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(true));
-                }
-                // Watcher: when the decoder signals "ended", give the audio
-                // buffer ~300 ms to drain, then post a notification back to
-                // the engine loop. Routing through the internal notify
-                // channel (not straight to `events`) is what lets the loop
-                // clear `cue_active` and lift the click duck before
-                // broadcasting CueEnded.
-                let watcher_ended = dec.ended;
-                let watcher_notify = notify_tx.clone();
-                std::thread::Builder::new()
-                    .name("cue-watcher".into())
-                    .spawn(move || {
-                        while !watcher_ended.load(Ordering::Relaxed) {
-                            std::thread::sleep(Duration::from_millis(100));
+                EngineCommand::StopCue => {
+                    if let Some(act) = active.as_mut() {
+                        let step = fade_step(50, act.out_rate);
+                        let _ = act.cmd_tx.push(PlayCommand::StopCue(step));
+                        if cue_active {
+                            cue_active = false;
+                            // Invalidate the current watcher before firing — we're
+                            // emitting CueEnded ourselves and don't want a delayed
+                            // duplicate from the watcher.
+                            cue_generation.fetch_add(1, Ordering::Relaxed);
+                            let _ = events.send(EngineEvent::CueEnded);
                         }
-                        std::thread::sleep(Duration::from_millis(300));
-                        let _ = watcher_notify.send(HostNotify::CueEnded(my_gen));
-                    })
-                    .ok();
-            }
-            EngineCommand::StopCue => {
-                if let Some(act) = active.as_mut() {
-                    let step = fade_step(50, act.out_rate);
-                    let _ = act.cmd_tx.push(PlayCommand::StopCue(step));
-                    if cue_active {
-                        cue_active = false;
-                        // Invalidate the current watcher before firing — we're
-                        // emitting CueEnded ourselves and don't want a delayed
-                        // duplicate from the watcher.
-                        cue_generation.fetch_add(1, Ordering::Relaxed);
-                        let _ = events.send(EngineEvent::CueEnded);
-                    }
-                    if duck_click_pref {
-                        let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(false));
+                        if duck_click_pref {
+                            let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(false));
+                        }
                     }
                 }
-            }
-            EngineCommand::SetVolume(v) => {
-                master = v;
-                if let Some(act) = active.as_mut() {
-                    let _ = act.cmd_tx.push(PlayCommand::SetMaster(v));
+                EngineCommand::SetVolume(v) => {
+                    master = v;
+                    if let Some(act) = active.as_mut() {
+                        let _ = act.cmd_tx.push(PlayCommand::SetMaster(v));
+                    }
                 }
-            }
-            EngineCommand::SetCueVolume(v) => {
-                cue_volume = v;
-                if let Some(act) = active.as_mut() {
-                    let _ = act.cmd_tx.push(PlayCommand::SetCueVolume(v));
+                EngineCommand::SetCueVolume(v) => {
+                    cue_volume = v;
+                    if let Some(act) = active.as_mut() {
+                        let _ = act.cmd_tx.push(PlayCommand::SetCueVolume(v));
+                    }
                 }
-            }
-            EngineCommand::SetCrossfade(ms) => {
-                crossfade_ms = ms.max(1);
-            }
-            EngineCommand::SetClickEnabled(en) => {
-                click_enabled = en;
-                if let Some(act) = active.as_mut() {
-                    let _ = act.cmd_tx.push(PlayCommand::SetClickEnabled(en));
+                EngineCommand::SetCrossfade(ms) => {
+                    crossfade_ms = ms.max(1);
                 }
-            }
-            EngineCommand::SetClickBpm(bpm) => {
-                click_bpm = bpm;
-                if let Some(act) = active.as_mut() {
-                    let _ = act.cmd_tx.push(PlayCommand::SetClickBpm(bpm));
+                EngineCommand::SetClickEnabled(en) => {
+                    click_enabled = en;
+                    if let Some(act) = active.as_mut() {
+                        let _ = act.cmd_tx.push(PlayCommand::SetClickEnabled(en));
+                    }
                 }
-            }
-            EngineCommand::SetClickBeats(b) => {
-                click_beats = b;
-                if let Some(act) = active.as_mut() {
-                    let _ = act.cmd_tx.push(PlayCommand::SetClickBeats(b));
+                EngineCommand::SetClickBpm(bpm) => {
+                    click_bpm = bpm;
+                    if let Some(act) = active.as_mut() {
+                        let _ = act.cmd_tx.push(PlayCommand::SetClickBpm(bpm));
+                    }
                 }
-            }
-            EngineCommand::SetClickAccent(a) => {
-                click_accent = a;
-                if let Some(act) = active.as_mut() {
-                    let _ = act.cmd_tx.push(PlayCommand::SetClickAccent(a));
+                EngineCommand::SetClickBeats(b) => {
+                    click_beats = b;
+                    if let Some(act) = active.as_mut() {
+                        let _ = act.cmd_tx.push(PlayCommand::SetClickBeats(b));
+                    }
                 }
-            }
-            EngineCommand::SetClickVolume(v) => {
-                click_volume = v;
-                if let Some(act) = active.as_mut() {
-                    let _ = act.cmd_tx.push(PlayCommand::SetClickVolume(v));
+                EngineCommand::SetClickAccent(a) => {
+                    click_accent = a;
+                    if let Some(act) = active.as_mut() {
+                        let _ = act.cmd_tx.push(PlayCommand::SetClickAccent(a));
+                    }
                 }
-            }
-            EngineCommand::SetDuckClick(pref) => {
-                duck_click_pref = pref;
-                if let Some(act) = active.as_mut() {
-                    let _ = act.cmd_tx.push(PlayCommand::SetClickDuckActive(pref && cue_active));
+                EngineCommand::SetClickVolume(v) => {
+                    click_volume = v;
+                    if let Some(act) = active.as_mut() {
+                        let _ = act.cmd_tx.push(PlayCommand::SetClickVolume(v));
+                    }
                 }
-            }
+                EngineCommand::SetDuckClick(pref) => {
+                    duck_click_pref = pref;
+                    if let Some(act) = active.as_mut() {
+                        let _ = act
+                            .cmd_tx
+                            .push(PlayCommand::SetClickDuckActive(pref && cue_active));
+                    }
+                }
+                EngineCommand::RunOutputTest { reply } => {
+                    let Some(act) = active.as_mut() else {
+                        let _ = reply.send(Err(
+                            "audio output not ready - set an output device first".into(),
+                        ));
+                        continue;
+                    };
+
+                    let frames = (act.out_rate as f32 * 1.5) as u64;
+                    let callback_calls = Arc::new(AtomicU64::new(0));
+                    let total_frames = Arc::new(AtomicU64::new(0));
+                    let nonzero_frames = Arc::new(AtomicU64::new(0));
+                    let peak_bits = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+                    let tone = DiagnosticTone {
+                        phase: 0.0,
+                        phase_inc: std::f32::consts::TAU * 440.0 / act.out_rate as f32,
+                        frames_left: frames,
+                        total_frames: total_frames.clone(),
+                        nonzero_frames: nonzero_frames.clone(),
+                        callback_calls: callback_calls.clone(),
+                        peak_bits: peak_bits.clone(),
+                    };
+
+                    if act
+                        .cmd_tx
+                        .push(PlayCommand::StartDiagnosticTone(tone))
+                        .is_err()
+                    {
+                        let _ = reply.send(Err("audio callback command queue is full".into()));
+                        continue;
+                    }
+
+                    let info = act.debug.clone();
+                    std::thread::Builder::new()
+                        .name("audio-debug-report".into())
+                        .spawn(move || {
+                            std::thread::sleep(Duration::from_millis(1800));
+                            let report = AudioDebugReport {
+                                host: info.host,
+                                device: info.device,
+                                sample_format: info.sample_format,
+                                sample_rate: info.sample_rate,
+                                channels: info.channels,
+                                pad_channels: info.pad_channels,
+                                callback_calls: callback_calls.load(Ordering::Relaxed),
+                                frames_written: total_frames.load(Ordering::Relaxed),
+                                nonzero_frames: nonzero_frames.load(Ordering::Relaxed),
+                                peak: f32::from_bits(peak_bits.load(Ordering::Relaxed)),
+                            };
+                            let _ = reply.send(Ok(report));
+                        })
+                        .ok();
+                }
             }
         } else if i == notify_idx {
             let n = match oper.recv(&notify_rx) {
@@ -889,33 +1042,13 @@ fn host_thread(
     }
 }
 
-/// Pick a usable supported config: prefer f32 (matches WASAPI default), fall
-/// back to i32 (typical for ASIO drivers). Anything else is rejected.
-fn pick_supported(
-    device: &cpal::Device,
-) -> Result<cpal::SupportedStreamConfig, String> {
-    let configs: Vec<_> = device
-        .supported_output_configs()
-        .map_err(|e| format!("supported configs: {e}"))?
-        .collect();
-
-    // Prefer f32 at the device's max-supported sample rate, falling back to i32.
-    let pick = |fmt: SampleFormat| {
-        configs
-            .iter()
-            .find(|c| c.sample_format() == fmt)
-            .cloned()
-            .map(|c| c.with_max_sample_rate())
-    };
-
-    if let Some(c) = pick(SampleFormat::F32) {
-        return Ok(c);
-    }
-    if let Some(c) = pick(SampleFormat::I32) {
-        return Ok(c);
-    }
-
-    // Last resort: whatever the driver reports as default.
+/// Pick a usable output config. ASIO's `supported_output_configs()` in cpal
+/// synthesizes one config for every channel count from 1..=device outputs, so
+/// grabbing the first matching format can accidentally open a 1-channel stream
+/// on a 32-out mixer. Prefer the driver's current/default config, which is what
+/// DAWs typically use and what fixed-rate devices like the DL32S report as
+/// 32ch @ 48 kHz.
+fn pick_supported(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, String> {
     let fallback = device
         .default_output_config()
         .map_err(|e| format!("default config: {e}"))?;
@@ -923,7 +1056,33 @@ fn pick_supported(
         fallback.sample_format(),
         SampleFormat::F32 | SampleFormat::I32
     ) {
-        Ok(fallback)
+        return Ok(fallback);
+    }
+
+    let configs: Vec<_> = device
+        .supported_output_configs()
+        .map_err(|e| format!("supported configs: {e}"))?
+        .collect();
+
+    // Fallback for hosts whose default config is odd but supported ranges are
+    // richer. Prefer the most channels, then 48 kHz if present, then f32/i32.
+    let mut candidates: Vec<_> = configs
+        .iter()
+        .filter(|c| matches!(c.sample_format(), SampleFormat::F32 | SampleFormat::I32))
+        .map(|c| c.with_max_sample_rate())
+        .collect();
+    candidates.sort_by_key(|c| {
+        let fmt_score = match c.sample_format() {
+            SampleFormat::F32 => 2,
+            SampleFormat::I32 => 1,
+            _ => 0,
+        };
+        let rate_score = u8::from(c.sample_rate().0 == 48_000);
+        (c.channels(), rate_score, fmt_score)
+    });
+
+    if let Some(c) = candidates.pop() {
+        Ok(c)
     } else {
         Err(format!(
             "device sample format {:?} is not supported (need f32 or i32)",
@@ -1013,6 +1172,9 @@ fn build_stream(
     };
 
     let click_gen = ClickGen::new(out_rate, click_init);
+    eprintln!(
+        "[audio] opening {host_label} '{device_name}' format={sample_format:?} rate={out_rate} channels={total_channels} pad=({pad_l},{pad_r}) click=({click_l},{click_r}) cue=({cue_l},{cue_r})"
+    );
 
     // Lock-free queue: host thread → real-time callback.
     let (cmd_tx, cmd_rx) = RingBuffer::<PlayCommand>::new(64);
@@ -1034,14 +1196,20 @@ fn build_stream(
         other => return Err(format!("unsupported sample format {other:?}")),
     };
 
-    stream
-        .play()
-        .map_err(|e| format!("start stream: {e}"))?;
+    stream.play().map_err(|e| format!("start stream: {e}"))?;
 
     Ok(ActiveStream {
         _stream: stream,
         cmd_tx,
         out_rate,
+        debug: StreamDebugInfo {
+            host: host_label.to_string(),
+            device: device_name.to_string(),
+            sample_format: format!("{sample_format:?}"),
+            sample_rate: out_rate,
+            channels: total_channels,
+            pad_channels: channels.pad,
+        },
     })
 }
 
@@ -1059,10 +1227,10 @@ struct ClickGen {
     beat_index: u32,
     // Active ping voice (one at a time — at 300 BPM the prior ping is long gone
     // before the next one fires).
-    osc_phase: f32,    // radians, wraps at 2π
-    osc_freq: f32,     // Hz
-    osc_env: f32,      // current envelope, decays per sample
-    osc_decay: f32,    // per-sample env multiplier
+    osc_phase: f32, // radians, wraps at 2π
+    osc_freq: f32,  // Hz
+    osc_env: f32,   // current envelope, decays per sample
+    osc_decay: f32, // per-sample env multiplier
     // Enable ramp: ~20 ms equal-rate fade in/out to suppress click-on-toggle.
     enable_ramp: f32,
     enable_target: f32,
@@ -1168,11 +1336,8 @@ impl ClickGen {
             self.beat_index = (self.beat_index + 1) % self.beats_per_bar.max(1);
         }
 
-        let s = self.osc_phase.sin()
-            * self.osc_env
-            * self.volume
-            * self.enable_ramp
-            * self.duck_ramp;
+        let s =
+            self.osc_phase.sin() * self.osc_env * self.volume * self.enable_ramp * self.duck_ramp;
         self.osc_phase += std::f32::consts::TAU * self.osc_freq / self.sample_rate;
         if self.osc_phase >= std::f32::consts::TAU {
             self.osc_phase -= std::f32::consts::TAU;
@@ -1250,11 +1415,51 @@ fn mix_one_frame(voices: &mut Vec<Voice>, master: f32, cue_volume: f32) -> Mixed
 }
 
 #[inline]
+fn record_peak(bits: &AtomicU32, value: f32) {
+    let value = value.abs();
+    let mut cur = bits.load(Ordering::Relaxed);
+    while value > f32::from_bits(cur) {
+        match bits.compare_exchange_weak(cur, value.to_bits(), Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => break,
+            Err(next) => cur = next,
+        }
+    }
+}
+
+#[inline]
+fn add_diagnostic_tone(mix: &mut MixedFrame, diag: &mut Option<DiagnosticTone>) {
+    let Some(tone) = diag.as_mut() else {
+        return;
+    };
+    if tone.frames_left == 0 {
+        *diag = None;
+        return;
+    }
+
+    let value = tone.phase.sin() * 0.35;
+    tone.phase += tone.phase_inc;
+    if tone.phase >= std::f32::consts::TAU {
+        tone.phase -= std::f32::consts::TAU;
+    }
+    tone.frames_left -= 1;
+
+    mix.pad_l += value;
+    mix.pad_r += value;
+    tone.total_frames.fetch_add(1, Ordering::Relaxed);
+    if value != 0.0 {
+        tone.nonzero_frames.fetch_add(1, Ordering::Relaxed);
+    }
+    record_peak(&tone.peak_bits, value);
+}
+
+#[inline]
 fn drain_commands(
     voices: &mut Vec<Voice>,
     master: &mut f32,
     cue_volume: &mut f32,
     click: &mut ClickGen,
+    diagnostic: &mut Option<DiagnosticTone>,
     cmd_rx: &mut rtrb::Consumer<PlayCommand>,
 ) {
     while let Ok(cmd) = cmd_rx.pop() {
@@ -1307,6 +1512,7 @@ fn drain_commands(
             PlayCommand::SetClickAccent(a) => click.set_accent(a),
             PlayCommand::SetClickVolume(v) => click.set_volume(v),
             PlayCommand::SetClickDuckActive(active) => click.set_duck_active(active),
+            PlayCommand::StartDiagnosticTone(tone) => *diagnostic = Some(tone),
         }
     }
 }
@@ -1372,12 +1578,24 @@ fn build_callback_f32(
     let mut master = master_init;
     let mut cue_volume = cue_volume_init;
     let mut click = click_init;
+    let mut diagnostic: Option<DiagnosticTone> = None;
 
     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-        drain_commands(&mut voices, &mut master, &mut cue_volume, &mut click, &mut cmd_rx);
+        drain_commands(
+            &mut voices,
+            &mut master,
+            &mut cue_volume,
+            &mut click,
+            &mut diagnostic,
+            &mut cmd_rx,
+        );
+        if let Some(tone) = diagnostic.as_ref() {
+            tone.callback_calls.fetch_add(1, Ordering::Relaxed);
+        }
 
         for frame in data.chunks_mut(layout.total) {
-            let m = mix_one_frame(&mut voices, master, cue_volume);
+            let mut m = mix_one_frame(&mut voices, master, cue_volume);
+            add_diagnostic_tone(&mut m, &mut diagnostic);
             let c = click.next_sample();
             write_frame_f32(frame, &layout, &m, c);
         }
@@ -1395,6 +1613,7 @@ fn build_callback_i32(
     let mut master = master_init;
     let mut cue_volume = cue_volume_init;
     let mut click = click_init;
+    let mut diagnostic: Option<DiagnosticTone> = None;
 
     // i32 full-scale. Headroom of 1 sample on the negative side avoids wrap.
     const SCALE: f32 = 2_147_483_520.0;
@@ -1404,10 +1623,21 @@ fn build_callback_i32(
     let mut scratch = [0.0f32; 64];
 
     move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
-        drain_commands(&mut voices, &mut master, &mut cue_volume, &mut click, &mut cmd_rx);
+        drain_commands(
+            &mut voices,
+            &mut master,
+            &mut cue_volume,
+            &mut click,
+            &mut diagnostic,
+            &mut cmd_rx,
+        );
+        if let Some(tone) = diagnostic.as_ref() {
+            tone.callback_calls.fetch_add(1, Ordering::Relaxed);
+        }
 
         for frame in data.chunks_mut(layout.total) {
-            let m = mix_one_frame(&mut voices, master, cue_volume);
+            let mut m = mix_one_frame(&mut voices, master, cue_volume);
+            add_diagnostic_tone(&mut m, &mut diagnostic);
             let c = click.next_sample();
 
             let n = frame.len().min(scratch.len());

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
-use crate::audio::{AudioEngine, DeviceInfo};
+use crate::audio::{AudioDebugReport, AudioEngine, DeviceInfo};
 use crate::cues::{self, Synthesizer, VoiceInfo};
 use crate::library;
 use crate::model::{now_unix_ms, Key, NowPlaying, Preset, QuickCue, Settings};
@@ -76,8 +76,8 @@ pub fn play_key_logic(
             s.cues.speak_key_on_change,
         )
     };
-    let path = path
-        .ok_or_else(|| format!("no file mapped for key {} in the active preset", k.as_str()))?;
+    let path =
+        path.ok_or_else(|| format!("no file mapped for key {} in the active preset", k.as_str()))?;
 
     engine.play(path)?;
     {
@@ -144,11 +144,7 @@ pub fn set_preset_logic(
     Ok(())
 }
 
-pub fn set_crossfade_logic(
-    core: &CoreState,
-    engine: &AudioEngine,
-    ms: u32,
-) -> Result<(), String> {
+pub fn set_crossfade_logic(core: &CoreState, engine: &AudioEngine, ms: u32) -> Result<(), String> {
     let ms = ms.clamp(100, 15_000);
     engine.set_crossfade(ms)?;
     core.settings.lock().unwrap().crossfade_ms = ms;
@@ -328,6 +324,11 @@ pub fn set_audio_output(
 }
 
 #[tauri::command]
+pub fn run_audio_output_test(engine: State<'_, AudioEngine>) -> Result<AudioDebugReport, String> {
+    engine.run_output_test()
+}
+
+#[tauri::command]
 pub fn set_volume(
     app: AppHandle,
     core: State<'_, CoreState>,
@@ -353,8 +354,12 @@ pub fn scan_library(
 
     let preset_name = {
         let s = core.settings.lock().unwrap();
-        name.clone()
-            .or_else(|| s.presets.iter().find(|p| p.id == id).map(|p| p.name.clone()))
+        name.clone().or_else(|| {
+            s.presets
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.name.clone())
+        })
     };
     let fresh = library::scan_preset(&folder_path, preset_name)?;
 
@@ -692,7 +697,11 @@ pub fn cue_speak_logic(
     Ok(())
 }
 
-pub fn cue_stop_logic(app: &AppHandle, core: &CoreState, engine: &AudioEngine) -> Result<(), String> {
+pub fn cue_stop_logic(
+    app: &AppHandle,
+    core: &CoreState,
+    engine: &AudioEngine,
+) -> Result<(), String> {
     engine.stop_cue()?;
     {
         let mut n = core.now.lock().unwrap();
@@ -873,7 +882,15 @@ pub fn cue_speak(
     synth: State<'_, CueSynth>,
     text: String,
 ) -> Result<(), String> {
-    cue_speak_logic(&app, core.inner(), engine.inner(), synth.0.as_ref(), &text, None, None)
+    cue_speak_logic(
+        &app,
+        core.inner(),
+        engine.inner(),
+        synth.0.as_ref(),
+        &text,
+        None,
+        None,
+    )
 }
 
 #[tauri::command]
@@ -967,4 +984,3 @@ pub fn set_cue_duck_click(
 pub fn set_cue_speak_key(core: State<'_, CoreState>, enabled: bool) -> Result<(), String> {
     set_cue_speak_key_logic(core.inner(), enabled)
 }
-

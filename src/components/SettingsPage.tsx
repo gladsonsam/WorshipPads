@@ -2,12 +2,15 @@
 // crossfade duration, and the duck-click toggle. Each card is a self-contained
 // concern; adding a fourth bus is one more card.
 
+import { useState } from "react";
 import {
+  runAudioOutputTest,
   setAudioOutput,
   setClickChannels,
   setCrossfade,
   setCueChannels,
   setCueDuckClick,
+  type AudioDebugReport,
   type DeviceInfo,
   type Settings,
 } from "../lib/ipc";
@@ -25,10 +28,13 @@ interface Props {
 // Stable composite value so the device dropdown can disambiguate same-named
 // drivers that exist on both WASAPI and ASIO (e.g. some USB interfaces).
 const DEVICE_SEP = "|>|";
-const deviceKey = (host: string, name: string): string => host + DEVICE_SEP + name;
+const deviceKey = (host: string, name: string): string =>
+  host + DEVICE_SEP + name;
 const splitDeviceKey = (key: string): [string, string] => {
   const i = key.indexOf(DEVICE_SEP);
-  return i < 0 ? ["WASAPI", key] : [key.slice(0, i), key.slice(i + DEVICE_SEP.length)];
+  return i < 0
+    ? ["WASAPI", key]
+    : [key.slice(0, i), key.slice(i + DEVICE_SEP.length)];
 };
 
 export function SettingsPage({
@@ -38,10 +44,21 @@ export function SettingsPage({
   guard,
   refreshSettings,
 }: Props) {
+  const [debugReport, setDebugReport] = useState<AudioDebugReport | null>(null);
+  const [debugError, setDebugError] = useState<string | null>(null);
+  const [debugBusy, setDebugBusy] = useState(false);
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 22 }}>
       <Card pad={22}>
-        <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 16 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 9,
+            marginBottom: 16,
+          }}
+        >
           <Icon name="sliders" size={17} stroke="var(--accent-ink)" />
           <Eyebrow style={{ letterSpacing: "0.1em" }}>Output device</Eyebrow>
         </div>
@@ -69,10 +86,74 @@ export function SettingsPage({
             })
           }
         />
+        <div
+          style={{
+            display: "flex",
+            gap: 10,
+            alignItems: "center",
+            marginTop: 14,
+          }}
+        >
+          <button
+            type="button"
+            className="btn btn-ghost"
+            disabled={!settings.output_device || debugBusy}
+            onClick={() =>
+              guard(async () => {
+                setDebugBusy(true);
+                setDebugError(null);
+                setDebugReport(null);
+                try {
+                  setDebugReport(await runAudioOutputTest());
+                } catch (e) {
+                  setDebugError(e instanceof Error ? e.message : String(e));
+                } finally {
+                  setDebugBusy(false);
+                }
+              })
+            }
+          >
+            <Icon name="play" size={15} />
+            {debugBusy ? "Testing..." : "Test pad output"}
+          </button>
+        </div>
+        {(debugReport || debugError) && (
+          <div
+            className="mono"
+            style={{
+              marginTop: 12,
+              padding: 12,
+              border: "1px solid var(--line)",
+              borderRadius: 8,
+              background: "var(--surface-2)",
+              color: debugError ? "var(--danger)" : "var(--text-2)",
+              fontSize: 12,
+              lineHeight: 1.6,
+              overflowX: "auto",
+            }}
+          >
+            {debugError ? (
+              `audio test failed: ${debugError}`
+            ) : debugReport ? (
+              <>
+                {`host=${debugReport.host} format=${debugReport.sample_format} rate=${debugReport.sample_rate} channels=${debugReport.channels}`}
+                <br />
+                {`pad=${debugReport.pad_channels[0] + 1}/${debugReport.pad_channels[1] + 1} callbacks=${debugReport.callback_calls} frames=${debugReport.frames_written} nonzero=${debugReport.nonzero_frames} peak=${debugReport.peak.toFixed(3)}`}
+              </>
+            ) : null}
+          </div>
+        )}
       </Card>
 
       <Card pad={22}>
-        <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 14 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 9,
+            marginBottom: 14,
+          }}
+        >
           <Icon name="waves" size={17} stroke="var(--accent-ink)" />
           <Eyebrow style={{ letterSpacing: "0.1em" }}>Pad output</Eyebrow>
         </div>
@@ -95,9 +176,18 @@ export function SettingsPage({
         />
 
         <div style={{ marginTop: 20 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              marginBottom: 10,
+            }}
+          >
             <Eyebrow style={{ letterSpacing: "0.08em" }}>Crossfade</Eyebrow>
-            <span className="mono" style={{ fontSize: 12, color: "var(--text-2)" }}>
+            <span
+              className="mono"
+              style={{ fontSize: 12, color: "var(--text-2)" }}
+            >
               {(settings.crossfade_ms / 1000).toFixed(1)} s
             </span>
           </div>
@@ -113,20 +203,33 @@ export function SettingsPage({
               })
             }
           />
-          <div style={{ display: "flex", justifyContent: "space-between", marginTop: 7 }}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              marginTop: 7,
+            }}
+          >
             <span className="mini-label">Instant</span>
             <span className="mini-label">Slow fade</span>
           </div>
         </div>
 
         <p className="helper-note">
-          Route the pads to a spare output pair on your interface so they don't land on
-          your main mix.
+          Route the pads to a spare output pair on your interface so they don't
+          land on your main mix.
         </p>
       </Card>
 
       <Card pad={22}>
-        <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 14 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 9,
+            marginBottom: 14,
+          }}
+        >
           <Icon name="metronome" size={17} stroke="var(--accent-ink)" />
           <Eyebrow style={{ letterSpacing: "0.1em" }}>Click output</Eyebrow>
         </div>
@@ -144,13 +247,20 @@ export function SettingsPage({
         />
 
         <p className="helper-note">
-          The click is mono. Use stereo only if your IEM bus expects a stereo pair —
-          most click busses are mono.
+          The click is mono. Use stereo only if your IEM bus expects a stereo
+          pair — most click busses are mono.
         </p>
       </Card>
 
       <Card pad={22}>
-        <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 14 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 9,
+            marginBottom: 14,
+          }}
+        >
           <Icon name="mic" size={17} stroke="var(--accent-ink)" />
           <Eyebrow style={{ letterSpacing: "0.1em" }}>Cue output</Eyebrow>
         </div>
@@ -182,8 +292,9 @@ export function SettingsPage({
         </label>
 
         <p className="helper-note">
-          Pick a spare output pair for spoken cues — they're meant for the band's IEMs,
-          not the main mix. To share the click bus, point this at the same channels.
+          Pick a spare output pair for spoken cues — they're meant for the
+          band's IEMs, not the main mix. To share the click bus, point this at
+          the same channels.
         </p>
       </Card>
     </div>

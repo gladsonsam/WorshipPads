@@ -9,7 +9,8 @@ import type { Key, NowPlaying } from "../shared/types";
 // in-memory mock so the UI is fully explorable. Production builds always run
 // inside Tauri, where `import.meta.env.DEV` is false and this whole branch (and
 // the dynamically-imported mock) is dropped from the bundle.
-const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+const inTauri =
+  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const useMock = import.meta.env.DEV && !inTauri;
 
 function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -29,6 +30,19 @@ export interface DeviceInfo {
   channels: number;
   default_sample_rate: number;
   is_default: boolean;
+}
+
+export interface AudioDebugReport {
+  host: string;
+  device: string;
+  sample_format: string;
+  sample_rate: number;
+  channels: number;
+  pad_channels: [number, number];
+  callback_calls: number;
+  frames_written: number;
+  nonzero_frames: number;
+  peak: number;
 }
 
 export interface Preset {
@@ -90,14 +104,19 @@ export interface ServerUrl {
 
 export const getSettings = () => invoke<Settings>("get_settings");
 export const getState = () => invoke<NowPlaying>("get_state");
-export const listAudioDevices = () => invoke<DeviceInfo[]>("list_audio_devices");
+export const listAudioDevices = () =>
+  invoke<DeviceInfo[]>("list_audio_devices");
 
 export const setAudioOutput = (
   host: string,
   device: string,
   channelLeft: number,
   channelRight: number,
-) => invoke<void>("set_audio_output", { host, device, channelLeft, channelRight });
+) =>
+  invoke<void>("set_audio_output", { host, device, channelLeft, channelRight });
+
+export const runAudioOutputTest = () =>
+  invoke<AudioDebugReport>("run_audio_output_test");
 
 export const setVolume = (volume: number) =>
   invoke<void>("set_volume", { volume });
@@ -199,7 +218,9 @@ export const setCueSpeakKey = (enabled: boolean) =>
   invoke<void>("set_cue_speak_key", { enabled });
 
 /** Subscribe to live now-playing updates pushed from the backend. */
-export const onNowPlaying = (cb: (n: NowPlaying) => void): Promise<UnlistenFn> => {
+export const onNowPlaying = (
+  cb: (n: NowPlaying) => void,
+): Promise<UnlistenFn> => {
   if (useMock) {
     return import("./mock").then((m) => m.mockListen(cb));
   }

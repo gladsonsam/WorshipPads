@@ -83,7 +83,9 @@ fn restore_audio(app: &tauri::AppHandle) {
     let _ = engine.set_click_volume(click_volume);
     let _ = engine.set_duck_click(duck_click);
     if let Some(device) = device {
-        if let Err(e) = engine.set_output(&host, &device, pad_channels, click_channels, cue_channels) {
+        if let Err(e) =
+            engine.set_output(&host, &device, pad_channels, click_channels, cue_channels)
+        {
             eprintln!("[boot] could not restore audio output '{device}' on {host}: {e}");
         }
     }
@@ -262,6 +264,7 @@ pub fn run() {
             commands::get_state,
             commands::list_audio_devices,
             commands::set_audio_output,
+            commands::run_audio_output_test,
             commands::set_volume,
             commands::scan_library,
             commands::remove_preset,
